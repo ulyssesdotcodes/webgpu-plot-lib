@@ -2,34 +2,30 @@
   description = "typescript build";
 
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
   outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = import nixpkgs {
-          inherit system;
-        };
-
-        buildNodeJs = pkgs.callPackage "${<nixpkgs>}/pkgs/development/web/nodejs/nodejs.nix" {
-          python = pkgs.python3;
-        };
-
-        nodejs = buildNodeJs {
-          enableNpm = true;
-          version = "24.15.0";
-          sha256 = "";
-        };
-      in rec {
-        flakedPkgs = pkgs;
-
-        devShell = pkgs.mkShell {
+    let pkgs = import nixpkgs {inherit system;};
+      in {
+        devShells = with pkgs; {
+          default = mkShell {
           buildInputs = with pkgs; [
             nodejs
           ];
+
+          npmDeps = importNpmLock.buildNodeModules {
+            npmRoot = ./.;
+            inherit nodejs;
+          };
+
+          shellHook = ''
+            npx tsc --watch &
+            npx http-server public
+          '';
         };
-      }
-    );
+      };
+    });
 }
