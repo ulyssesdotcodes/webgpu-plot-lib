@@ -1,4 +1,4 @@
-import { type SeriesBufferView, createSeriesBuffer, setStyle } from './format.js';
+import { type SeriesBufferView, createSeriesBuffer, setStyle, recomputeExtents } from './format.js';
 
 // Small library of generators that produce a fully-populated SeriesBuffer for
 // the demo / tests. They write directly into the typed-array views the format
@@ -28,10 +28,10 @@ export function generateLines(seriesCount: number, pointCount: number): SeriesBu
 
     const hue = s / seriesCount;
     const [r, g, b] = hslToRgb(hue, 0.7, 0.6);
-    setStyle(sb, s, { color: [r, g, b, 1], width: 1.75 });
+    setStyle(sb, s, { color: [r, g, b, 1], width: 2.5 });
   }
 
-  // Extents are computed on the GPU by LineChart during init.
+  recomputeExtents(sb);
   return sb;
 }
 

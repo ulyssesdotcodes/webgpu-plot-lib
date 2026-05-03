@@ -42,11 +42,11 @@ export interface SeriesStyle {
 
 export interface SeriesBufferView {
   buffer: ArrayBuffer;
-  header: Uint32Array;     // u32 view of the header (length 16)
-  headerF: Float32Array;   // f32 view of the header (length 16)
-  x: Float32Array;         // pointCount
-  y: Float32Array;         // seriesCount * pointCount, series-major
-  meta: Float32Array;      // seriesCount * 8 floats
+  header:  Uint32Array<ArrayBuffer>;   // u32 view of the header (length 16)
+  headerF: Float32Array<ArrayBuffer>;  // f32 view of the header (length 16)
+  x:    Float32Array<ArrayBuffer>;     // pointCount
+  y:    Float32Array<ArrayBuffer>;     // seriesCount * pointCount, series-major
+  meta: Float32Array<ArrayBuffer>;     // seriesCount * 8 floats
   seriesCount: number;
   pointCount: number;
 }
@@ -82,7 +82,7 @@ export function createSeriesBuffer(seriesCount: number, pointCount: number): Ser
   for (let s = 0; s < seriesCount; s++) {
     const o = s * 8;
     meta[o] = 1; meta[o + 1] = 1; meta[o + 2] = 1; meta[o + 3] = 1;
-    meta[o + 4] = 1.5;
+    meta[o + 4] = 2.5;
   }
 
   return { buffer, header, headerF, x, y, meta, seriesCount, pointCount };

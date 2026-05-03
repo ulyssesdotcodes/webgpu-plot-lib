@@ -23,7 +23,7 @@
 
           shellHook = ''
             npx tsc --watch &
-            npx http-server public
+            npx http-server  -c-1 public
           '';
         };
       };
