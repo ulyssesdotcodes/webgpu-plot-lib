@@ -10,7 +10,7 @@ async function main(): Promise<void> {
   const canvas = document.querySelector('canvas');
   if (!canvas) fail('no canvas element');
 
-  const data = generateLines(6, 4096);
+  const data = generateLines(6, 4096 * 8);
 
   const chart = await LineChart.create(canvas, data);
 

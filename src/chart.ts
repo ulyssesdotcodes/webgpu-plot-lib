@@ -21,6 +21,16 @@ const SPLINE_PARAMS_BYTES = 16;
 // GridStyle uniform: vec4 color + vec4 bg = 32 bytes; written once at init.
 const STYLE_BYTES = 32;
 
+// ExtentParams uniform: xMin, xMax (f32) + totalY, pointCount (u32) = 16 bytes.
+const EXTENT_PARAMS_BYTES = 16;
+// ExtentResult: yMin, yMax (f32) = 8 bytes.
+const EXTENT_RESULT_BYTES = 8;
+
+// Characters supported by the font atlas (order determines charMeta index).
+const TEXT_CHARS     = '0123456789.-';
+// Max characters across all labels in one frame.
+const TEXT_MAX_CHARS = 512;
+
 export interface LineChartOptions {
   /** Background fill. */
   background?: [number, number, number, number];
@@ -49,14 +59,30 @@ export class LineChart {
   private yBuf!:     GPUBuffer;
   private metaBuf!:  GPUBuffer;
 
-  private splinePipeline!:   GPUComputePipeline;
-  private gridPipeline!:     GPURenderPipeline;
-  private linePipeline!:     GPURenderPipeline;
-  private splineBind!:       GPUBindGroup;
-  private gridBind!:         GPUBindGroup;
-  private lineBind!:         GPUBindGroup;
-  private splineBuf!:        GPUBuffer;
-  private splineParamsBuf!:  GPUBuffer;
+  private splinePipeline!:    GPUComputePipeline;
+  private extentPipeline!:    GPUComputePipeline;
+  private gridPipeline!:      GPURenderPipeline;
+  private linePipeline!:      GPURenderPipeline;
+  private splineBind!:        GPUBindGroup;
+  private extentBind!:        GPUBindGroup;
+  private gridBind!:          GPUBindGroup;
+  private lineBind!:          GPUBindGroup;
+  private splineBuf!:         GPUBuffer;
+  private splineParamsBuf!:   GPUBuffer;
+  private extentParamsBuf!:   GPUBuffer;
+  private extentResultBuf!:   GPUBuffer;
+  private extentReadbackBuf!: GPUBuffer;
+  private extentInFlight      = false;
+  private extentDirty         = false;
+
+  private textPipeline!:   GPURenderPipeline;
+  private textBind!:       GPUBindGroup;
+  private textInstBuf!:    GPUBuffer;
+  private atlasTexture!:   GPUTexture;
+  private atlasSampler!:   GPUSampler;
+  private charMeta:        Array<{ uMin: number; uMax: number; width: number }> = [];
+  private atlasH           = 0;
+  private textCharCount    = 0;
 
 
   // View state — data-domain rectangle currently visible.
@@ -65,7 +91,6 @@ export class LineChart {
 
   private dragging   = false;
   private lastMouseX = 0;
-  private lastMouseY = 0;
 
   // CSS-pixel canvas dimensions, kept by ResizeObserver.
   private cssWidth  = 1;
@@ -101,14 +126,16 @@ export class LineChart {
     const format = navigator.gpu.getPreferredCanvasFormat();
     context.configure({ device, format, alphaMode: 'opaque' });
 
-    const [grid, lines, spline] = await Promise.all([
+    const [grid, lines, spline, extent, text] = await Promise.all([
       fetchShader(device, '/shaders/grid.wgsl',   'grid'),
       fetchShader(device, '/shaders/lines.wgsl',  'lines'),
       fetchShader(device, '/shaders/spline.wgsl', 'spline'),
+      fetchShader(device, '/shaders/extent.wgsl', 'extent'),
+      fetchShader(device, '/shaders/text.wgsl',   'text'),
     ]);
 
     const chart = new LineChart(canvas, context, device, format, series, options);
-    chart.buildResources(grid, lines, spline);
+    chart.buildResources(grid, lines, spline, extent, text);
     chart.attachEvents();
     chart.resetView();
     return chart;
@@ -149,6 +176,8 @@ export class LineChart {
     const h   = Math.max(1, Math.floor(this.cssHeight * dpr));
     this.writeViewAll(w, h);
     this.viewInitialized = true;
+    this.updateLabels();
+    this.requestExtent();
     this.requestRender();
   }
 
@@ -176,7 +205,7 @@ export class LineChart {
 
   // ---- setup ---------------------------------------------------------------
 
-  private buildResources(gridMod: GPUShaderModule, lineMod: GPUShaderModule, splineMod: GPUShaderModule): void {
+  private buildResources(gridMod: GPUShaderModule, lineMod: GPUShaderModule, splineMod: GPUShaderModule, extentMod: GPUShaderModule, textMod: GPUShaderModule): void {
     const { device, series } = this;
 
     const totalSamples = SUBDIVS * (series.pointCount - 1) + 1;
@@ -188,7 +217,10 @@ export class LineChart {
     this.yBuf            = device.createBuffer({ label: 'y',             size: series.y.byteLength,                    usage: GPUBufferUsage.STORAGE  | GPUBufferUsage.COPY_DST });
     this.metaBuf         = device.createBuffer({ label: 'meta',          size: series.meta.byteLength,                 usage: GPUBufferUsage.STORAGE  | GPUBufferUsage.COPY_DST });
     this.splineParamsBuf = device.createBuffer({ label: 'spline-params', size: SPLINE_PARAMS_BYTES,                    usage: GPUBufferUsage.UNIFORM  | GPUBufferUsage.COPY_DST });
-    this.splineBuf       = device.createBuffer({ label: 'spline',        size: series.seriesCount * totalSamples * 8,  usage: GPUBufferUsage.STORAGE });
+    this.splineBuf          = device.createBuffer({ label: 'spline',          size: series.seriesCount * totalSamples * 8, usage: GPUBufferUsage.STORAGE });
+    this.extentParamsBuf    = device.createBuffer({ label: 'extent-params',   size: EXTENT_PARAMS_BYTES,                   usage: GPUBufferUsage.UNIFORM  | GPUBufferUsage.COPY_DST });
+    this.extentResultBuf    = device.createBuffer({ label: 'extent-result',   size: EXTENT_RESULT_BYTES,                   usage: GPUBufferUsage.STORAGE  | GPUBufferUsage.COPY_SRC });
+    this.extentReadbackBuf  = device.createBuffer({ label: 'extent-readback', size: EXTENT_RESULT_BYTES,                   usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
 
     this.uploadData();
 
@@ -203,6 +235,12 @@ export class LineChart {
       label:  'spline',
       layout: 'auto',
       compute: { module: splineMod, entryPoint: 'main' },
+    });
+
+    this.extentPipeline = device.createComputePipeline({
+      label:  'extent',
+      layout: 'auto',
+      compute: { module: extentMod, entryPoint: 'main' },
     });
 
     this.gridPipeline = device.createRenderPipeline({
@@ -241,13 +279,23 @@ export class LineChart {
       ],
     });
 
-    // this.gridBind = device.createBindGroup({
-    //   layout: this.gridPipeline.getBindGroupLayout(0),
-    //   entries: [
-    //     { binding: 0, resource: { buffer: this.viewBuf   } },
-    //     { binding: 1, resource: { buffer: this.styleBuf  } },
-    //   ],
-    // });
+    this.gridBind = device.createBindGroup({
+      layout: this.gridPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.viewBuf   } },
+        { binding: 1, resource: { buffer: this.styleBuf  } },
+      ],
+    });
+
+    this.extentBind = device.createBindGroup({
+      layout: this.extentPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.extentParamsBuf  } },
+        { binding: 1, resource: { buffer: this.xBuf             } },
+        { binding: 2, resource: { buffer: this.yBuf             } },
+        { binding: 3, resource: { buffer: this.extentResultBuf  } },
+      ],
+    });
 
     this.lineBind = device.createBindGroup({
       layout: this.linePipeline.getBindGroupLayout(0),
@@ -258,8 +306,101 @@ export class LineChart {
       ],
     });
 
+    // Font atlas + text pipeline.
+    this.buildAtlas();
+
+    this.textInstBuf = device.createBuffer({
+      label: 'text-inst',
+      size:  TEXT_MAX_CHARS * 8 * 4,  // 8 floats × 4 bytes per char
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    this.textPipeline = device.createRenderPipeline({
+      label:  'text',
+      layout: 'auto',
+      vertex:   { module: textMod, entryPoint: 'vs' },
+      fragment: {
+        module: textMod, entryPoint: 'fs',
+        targets: [{
+          format: this.format,
+          blend: {
+            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one',       dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          },
+        }],
+      },
+      primitive: { topology: 'triangle-list' },
+    });
+
+    this.textBind = device.createBindGroup({
+      layout: this.textPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.textInstBuf  } },
+        { binding: 1, resource: this.atlasTexture.createView() },
+        { binding: 2, resource: this.atlasSampler             },
+      ],
+    });
+
     // Bake the initial spline (pipelines and bind groups are ready now).
     this.bakeSpline();
+  }
+
+  private buildAtlas(): void {
+    const font  = '12px monospace';
+    const pad   = 1;
+
+    // Measure each character using a throw-away canvas.
+    const mCanvas = document.createElement('canvas');
+    mCanvas.width  = 1;
+    mCanvas.height = 1;
+    const mctx = mCanvas.getContext('2d')!;
+    mctx.font = font;
+
+    const metrics  = mctx.measureText('0');
+    this.atlasH    = Math.ceil(metrics.actualBoundingBoxAscent + metrics.actualBoundingBoxDescent) + 4;
+
+    const slotWidths = Array.from(TEXT_CHARS).map(c => Math.ceil(mctx.measureText(c).width) + pad * 2);
+    const totalW     = slotWidths.reduce((a, b) => a + b, 0);
+    // bytesPerRow must be multiple of 256; with rgba8unorm that means width % 64 === 0.
+    const texW       = Math.ceil(totalW / 64) * 64;
+
+    const aCanvas = document.createElement('canvas');
+    aCanvas.width  = texW;
+    aCanvas.height = this.atlasH;
+    const ctx = aCanvas.getContext('2d')!;
+    ctx.font         = font;
+    ctx.fillStyle    = 'white';
+    ctx.textBaseline = 'middle';
+
+    let x = 0;
+    this.charMeta = [];
+    for (let i = 0; i < TEXT_CHARS.length; i++) {
+      const w = slotWidths[i]!;
+      ctx.fillText(TEXT_CHARS[i]!, x + pad, this.atlasH / 2);
+      this.charMeta.push({ uMin: x / texW, uMax: (x + w) / texW, width: w });
+      x += w;
+    }
+
+    const imgData = ctx.getImageData(0, 0, texW, this.atlasH);
+
+    this.atlasTexture = this.device.createTexture({
+      label:  'font-atlas',
+      size:   [texW, this.atlasH],
+      format: 'rgba8unorm',
+      usage:  GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    this.device.queue.writeTexture(
+      { texture: this.atlasTexture },
+      imgData.data,
+      { bytesPerRow: texW * 4, rowsPerImage: this.atlasH },
+      [texW, this.atlasH],
+    );
+
+    this.atlasSampler = this.device.createSampler({
+      label:     'font-sampler',
+      magFilter: 'linear',
+      minFilter: 'linear',
+    });
   }
 
   // Dispatch the compute shader to evaluate the Catmull-Rom spline into
@@ -300,6 +441,7 @@ export class LineChart {
         const h   = Math.max(1, Math.floor(this.cssHeight * dpr));
         this.writeViewViewportStep(w, h);
       }
+      this.updateLabels();
       this.requestRender();
     };
     sync();
@@ -308,7 +450,6 @@ export class LineChart {
     this.canvas.addEventListener('mousedown', (e) => {
       this.dragging   = true;
       this.lastMouseX = e.clientX;
-      this.lastMouseY = e.clientY;
       this.canvas.style.cursor = 'grabbing';
     });
     window.addEventListener('mouseup', () => {
@@ -318,10 +459,8 @@ export class LineChart {
     window.addEventListener('mousemove', (e) => {
       if (!this.dragging) return;
       const dx = e.clientX - this.lastMouseX;
-      const dy = e.clientY - this.lastMouseY;
       this.lastMouseX = e.clientX;
-      this.lastMouseY = e.clientY;
-      this.panByCssPixels(dx, dy);
+      this.panByCssPixels(dx);
     });
     this.canvas.addEventListener('wheel', (e) => {
       e.preventDefault();
@@ -334,25 +473,23 @@ export class LineChart {
 
   // ---- view math -----------------------------------------------------------
 
-  private panByCssPixels(dxCss: number, dyCss: number): void {
-    const dx = (dxCss / this.cssWidth)  * (this.dataMaxX - this.dataMinX);
-    const dy = (dyCss / this.cssHeight) * (this.dataMaxY - this.dataMinY);
+  private panByCssPixels(dxCss: number): void {
+    const dx = (dxCss / this.cssWidth) * (this.dataMaxX - this.dataMinX);
     this.dataMinX -= dx; this.dataMaxX -= dx;
-    this.dataMinY += dy; this.dataMaxY += dy;
     this.writeViewOffset();
+    this.updateLabels();
+    this.requestExtent();
     this.requestRender();
   }
 
-  private zoomAt(cssX: number, cssY: number, factor: number): void {
+  private zoomAt(cssX: number, _cssY: number, factor: number): void {
     const fx = cssX / this.cssWidth;
-    const fy = 1 - cssY / this.cssHeight;
     const ax = this.dataMinX + fx * (this.dataMaxX - this.dataMinX);
-    const ay = this.dataMinY + fy * (this.dataMaxY - this.dataMinY);
     this.dataMinX = ax + (this.dataMinX - ax) / factor;
     this.dataMaxX = ax + (this.dataMaxX - ax) / factor;
-    this.dataMinY = ay + (this.dataMinY - ay) / factor;
-    this.dataMaxY = ay + (this.dataMaxY - ay) / factor;
     this.writeViewScaleOffsetStep();
+    this.updateLabels();
+    this.requestExtent();
     this.requestRender();
   }
 
@@ -363,6 +500,10 @@ export class LineChart {
   private viewStaging  = new ArrayBuffer(VIEW_BYTES);
   private viewStagingF = new Float32Array(this.viewStaging);
   private viewStagingU = new Uint32Array(this.viewStaging);
+
+  private extentParams  = new ArrayBuffer(EXTENT_PARAMS_BYTES);
+  private extentParamsF = new Float32Array(this.extentParams);
+  private extentParamsU = new Uint32Array(this.extentParams);
 
   // Drag: only the offset (data-domain centre) changes.
   private writeViewOffset(): void {
@@ -410,6 +551,120 @@ export class LineChart {
     this.device.queue.writeBuffer(this.viewBuf, 0, this.viewStaging);
   }
 
+  // ---- extent compute + Y autoscale ----------------------------------------
+
+  private requestExtent(): void {
+    if (this.extentInFlight) { this.extentDirty = true; return; }
+    this.extentInFlight = true;
+    this.extentDirty    = false;
+
+    const totalY = this.series.seriesCount * this.series.pointCount;
+    this.extentParamsF[0] = this.dataMinX;
+    this.extentParamsF[1] = this.dataMaxX;
+    this.extentParamsU[2] = totalY;
+    this.extentParamsU[3] = this.series.pointCount;
+    this.device.queue.writeBuffer(this.extentParamsBuf, 0, this.extentParams);
+
+    const enc = this.device.createCommandEncoder();
+    const cp  = enc.beginComputePass();
+    cp.setPipeline(this.extentPipeline);
+    cp.setBindGroup(0, this.extentBind);
+    cp.dispatchWorkgroups(1);
+    cp.end();
+    enc.copyBufferToBuffer(this.extentResultBuf, 0, this.extentReadbackBuf, 0, EXTENT_RESULT_BYTES);
+    this.device.queue.submit([enc.finish()]);
+
+    this.extentReadbackBuf.mapAsync(GPUMapMode.READ).then(() => {
+      const arr  = new Float32Array(this.extentReadbackBuf.getMappedRange());
+      const yMin = arr[0]!;
+      const yMax = arr[1]!;
+      this.extentReadbackBuf.unmap();
+      this.extentInFlight = false;
+      this.applyAutoscaleY(yMin, yMax);
+      if (this.extentDirty) this.requestExtent();
+    }).catch(() => {
+      this.extentInFlight = false;
+    });
+  }
+
+  private applyAutoscaleY(yMin: number, yMax: number): void {
+    if (!isFinite(yMin) || !isFinite(yMax) || yMax <= yMin) return;
+    const pad = (yMax - yMin) * 0.05 || 0.5;
+    this.dataMinY = yMin - pad;
+    this.dataMaxY = yMax + pad;
+    this.writeViewScaleOffsetStep();
+    this.updateLabels();
+    this.requestRender();
+  }
+
+  // ---- label overlay -------------------------------------------------------
+
+  private updateLabels(): void {
+    if (!this.viewInitialized || this.charMeta.length === 0) return;
+
+    const w     = this.cssWidth;
+    const h     = this.cssHeight;
+    const stepX = this.viewStagingF[6]!;
+    const stepY = this.viewStagingF[7]!;
+
+    const inst = new Float32Array(TEXT_MAX_CHARS * 8);
+    let count  = 0;
+
+    // Emit one CharInst per character at the given cursor position.
+    const emitChar = (c: string, curX: number, topY: number) => {
+      if (count >= TEXT_MAX_CHARS) return 0;
+      const idx = TEXT_CHARS.indexOf(c);
+      if (idx < 0) return 0;
+      const m    = this.charMeta[idx]!;
+      const ndcX =  (curX / w) * 2 - 1;
+      const ndcY = 1 - (topY / h) * 2;
+      const ndcW = (m.width / w) * 2;
+      const ndcH = (this.atlasH / h) * 2;
+      const off  = count * 8;
+      inst[off]   = ndcX;  inst[off+1] = ndcY;
+      inst[off+2] = ndcW;  inst[off+3] = ndcH;
+      inst[off+4] = m.uMin; inst[off+5] = 0;
+      inst[off+6] = m.uMax; inst[off+7] = 1;
+      count++;
+      return m.width;
+    };
+
+    // Emit a full label string, horizontally centered around anchorX if centerX.
+    const emitLabel = (text: string, anchorX: number, anchorY: number, centerX: boolean) => {
+      let totalW = 0;
+      for (const c of text) {
+        const idx = TEXT_CHARS.indexOf(c);
+        if (idx >= 0) totalW += this.charMeta[idx]!.width;
+      }
+      let curX = centerX ? anchorX - totalW / 2 : anchorX;
+      const topY = anchorY - this.atlasH / 2;
+      for (const c of text) curX += emitChar(c, curX, topY);
+    };
+
+    if (stepX > 0 && w > 0) {
+      const first = Math.ceil(this.dataMinX / stepX) * stepX;
+      for (let v = first; v < this.dataMaxX + stepX * 1e-6; v += stepX) {
+        const px = (v - this.dataMinX) / (this.dataMaxX - this.dataMinX) * w;
+        if (px < 0 || px > w) continue;
+        emitLabel(formatTick(v, stepX), px, h - this.atlasH / 2 - 4, true);
+      }
+    }
+
+    if (stepY > 0 && h > 0) {
+      const first = Math.ceil(this.dataMinY / stepY) * stepY;
+      for (let v = first; v < this.dataMaxY + stepY * 1e-6; v += stepY) {
+        const py = (1 - (v - this.dataMinY) / (this.dataMaxY - this.dataMinY)) * h;
+        if (py < 0 || py > h) continue;
+        emitLabel(formatTick(v, stepY), 6, py, false);
+      }
+    }
+
+    this.textCharCount = count;
+    if (count > 0) {
+      this.device.queue.writeBuffer(this.textInstBuf, 0, inst, 0, count * 8);
+    }
+  }
+
   // ---- render --------------------------------------------------------------
 
   private render(): void {
@@ -433,15 +688,22 @@ export class LineChart {
       }],
     });
 
-    // pass.setPipeline(this.gridPipeline);
-    // pass.setBindGroup(0, this.gridBind);
-    // pass.draw(3);
+    pass.setPipeline(this.gridPipeline);
+    pass.setBindGroup(0, this.gridBind);
+    pass.draw(3);
 
     pass.setPipeline(this.linePipeline);
     pass.setBindGroup(0, this.lineBind);
     if (this.series.pointCount >= 2) {
       pass.draw(2 * (SUBDIVS * (this.series.pointCount - 1) + 1), this.series.seriesCount);
     }
+
+    if (this.textCharCount > 0) {
+      pass.setPipeline(this.textPipeline);
+      pass.setBindGroup(0, this.textBind);
+      pass.draw(6, this.textCharCount);
+    }
+
     pass.end();
 
     this.device.queue.submit([encoder.finish()]);
@@ -464,6 +726,11 @@ async function fetchShader(device: GPUDevice, path: string, label: string): Prom
   if (!res.ok) throw new Error(`Failed to load shader ${path}: ${res.status}`);
   const code = await res.text();
   return device.createShaderModule({ label, code });
+}
+
+function formatTick(v: number, step: number): string {
+  const decimals = Math.max(0, -Math.floor(Math.log10(step)));
+  return v.toFixed(decimals);
 }
 
 function niceStep(range: number, viewportPx: number, targetPx: number): number {
