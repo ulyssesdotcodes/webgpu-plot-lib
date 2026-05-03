@@ -31,6 +31,12 @@ const TEXT_CHARS     = '0123456789.-';
 // Max characters across all labels in one frame.
 const TEXT_MAX_CHARS = 512;
 
+export interface HoverInfo {
+  point: number;
+  x:     number;
+  ys:    Float32Array;
+}
+
 export interface LineChartOptions {
   /** Background fill. */
   background?: [number, number, number, number];
@@ -42,6 +48,8 @@ export interface LineChartOptions {
    * Pass `devicePixelRatio` for crisp lines when the compositor path is fast.
    */
   pixelRatio?: number;
+  /** Called when the hovered X column changes. null = cursor left the chart. */
+  onHover?: (info: HoverInfo | null) => void;
 }
 
 export class LineChart {
@@ -51,7 +59,7 @@ export class LineChart {
   private format:  GPUTextureFormat;
 
   private series: SeriesBufferView;
-  private opts:   Required<LineChartOptions>;
+  private opts:   Required<Omit<LineChartOptions, 'onHover'>> & Pick<LineChartOptions, 'onHover'>;
 
   private viewBuf!:  GPUBuffer;
   private styleBuf!: GPUBuffer;
@@ -91,6 +99,7 @@ export class LineChart {
 
   private dragging   = false;
   private lastMouseX = 0;
+  private lastHoverPoint = -1;
 
   // CSS-pixel canvas dimensions, kept by ResizeObserver.
   private cssWidth  = 1;
@@ -158,6 +167,7 @@ export class LineChart {
       background: options.background ?? [0.07, 0.08, 0.11, 1],
       gridColor:  options.gridColor  ?? [0.22, 0.24, 0.28, 1],
       pixelRatio: options.pixelRatio ?? 1,
+      ...(options.onHover !== undefined ? { onHover: options.onHover } : {}),
     };
   }
 
@@ -453,6 +463,7 @@ export class LineChart {
       this.canvas.style.cursor = 'grabbing';
     });
     window.addEventListener('mouseup', () => {
+      if (this.dragging) this.requestExtent();
       this.dragging = false;
       this.canvas.style.cursor = '';
     });
@@ -469,6 +480,40 @@ export class LineChart {
       this.zoomAt(e.clientX - rect.left, e.clientY - rect.top, factor);
     }, { passive: false });
     this.canvas.addEventListener('dblclick', () => this.resetView());
+
+    this.canvas.addEventListener('mousemove', (e) => {
+      if (this.dragging) return;
+      const rect = this.canvas.getBoundingClientRect();
+      this.pickX(e.clientX - rect.left);
+    });
+    this.canvas.addEventListener('mouseleave', () => {
+      if (this.lastHoverPoint !== -1) {
+        this.lastHoverPoint = -1;
+        this.opts.onHover?.(null);
+      }
+    });
+  }
+
+  private pickX(cssX: number): void {
+    const dataX = this.dataMinX + (cssX / this.cssWidth) * (this.dataMaxX - this.dataMinX);
+    const x = this.series.x;
+    const N = this.series.pointCount;
+
+    let lo = 0, hi = N;
+    while (lo < hi) { const m = (lo + hi) >>> 1; if (x[m]! < dataX) lo = m + 1; else hi = m; }
+    // lo is first index where x[lo] >= dataX; check lo and lo-1
+    const i = (lo > 0 && lo < N && Math.abs(x[lo - 1]! - dataX) <= Math.abs(x[lo]! - dataX))
+      ? lo - 1
+      : Math.min(lo, N - 1);
+
+    if (i === this.lastHoverPoint) return;
+    this.lastHoverPoint = i;
+
+    const ys = new Float32Array(this.series.seriesCount);
+    for (let s = 0; s < this.series.seriesCount; s++) {
+      ys[s] = this.series.y[s * N + i]!;
+    }
+    this.opts.onHover?.({ point: i, x: x[i]!, ys });
   }
 
   // ---- view math -----------------------------------------------------------
@@ -478,7 +523,6 @@ export class LineChart {
     this.dataMinX -= dx; this.dataMaxX -= dx;
     this.writeViewOffset();
     this.updateLabels();
-    this.requestExtent();
     this.requestRender();
   }
 
