@@ -27,20 +27,15 @@ const TRI = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0
 }
 
 @fragment fn fs(@builtin(position) frag: vec4f) -> @location(0) vec4f {
-  let ndc = vec2f(
-    (frag.x / view.viewport.x) * 2.0 - 1.0,
-    1.0 - (frag.y / view.viewport.y) * 2.0,
-  );
-  let data = ndc / view.scale + view.offset;
+  let ndcX  = (frag.x / view.viewport.x) * 2.0 - 1.0;
+  let dataX = ndcX / view.scale.x + view.offset.x;
 
-  let g = abs(fract(data / view.gridStep + vec2f(0.5)) - vec2f(0.5)) * view.gridStep;
+  let gx = abs(fract(dataX / view.gridStep.x + 0.5) - 0.5) * view.gridStep.x;
 
-  let dataPerPx = abs(vec2f(2.0) / (view.scale * view.viewport));
-  let halfLine  = dataPerPx * 0.5;
+  let dataPerPxX = abs(2.0 / (view.scale.x * view.viewport.x));
+  let halfLine   = dataPerPxX * 0.5;
 
-  let mx = 1.0 - smoothstep(halfLine.x, halfLine.x + dataPerPx.x, g.x);
-  let my = 1.0 - smoothstep(halfLine.y, halfLine.y + dataPerPx.y, g.y);
-  let m  = max(mx, my);
+  let m = 1.0 - smoothstep(halfLine, halfLine + dataPerPxX, gx);
 
   return vec4f(mix(style.bg.rgb, style.color.rgb, m * style.color.a), 1.0);
 }

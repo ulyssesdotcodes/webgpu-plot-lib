@@ -13,14 +13,17 @@ async function main(): Promise<void> {
   const tooltip = document.getElementById('tooltip');
   if (!tooltip) fail('no #tooltip element');
 
-  const data = generateLines(6, 4096 * 8);
+  const data = generateLines([3, 2, 2], 4096 * 8);
 
   const chart = await LineChart.create(canvas, data, {
     onHover: (info: HoverInfo | null) => {
       if (!info) { tooltip.style.display = 'none'; return; }
       const lines = [`<b>x = ${info.x.toFixed(4)}</b>`];
       for (let s = 0; s < info.ys.length; s++) {
-        lines.push(`series ${s}: ${info.ys[s]!.toFixed(4)}`);
+        const r = Math.round(data.meta[s * 8 + 0]! * 255);
+        const g = Math.round(data.meta[s * 8 + 1]! * 255);
+        const b = Math.round(data.meta[s * 8 + 2]! * 255);
+        lines.push(`<span style="color:rgb(${r},${g},${b})">■</span> ${info.ys[s]!.toFixed(4)}`);
       }
       tooltip.style.display = 'block';
       tooltip.innerHTML = lines.join('<br>');

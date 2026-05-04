@@ -1,16 +1,23 @@
 import {
   type SeriesBufferView,
   getExtents,
+  getAxisColor,
+  getAxisCpuExtents,
+  getSeriesAxis,
 } from './format.js';
 
 // View uniform layout — must match lines.wgsl and grid.wgsl:
-//   offset 0   vec2f scale       ndc = (data - offset) * scale
-//   offset 8   vec2f offset      data-domain centre
+//   offset 0   vec2f scale       ndc = (data - offset) * scale  (scale.y unused; Y handled per-axis)
+//   offset 8   vec2f offset
 //   offset 16  vec2f viewport    physical pixels
-//   offset 24  vec2f gridStep    nice tick spacing (data units)
+//   offset 24  vec2f gridStep    x tick spacing (data units); gridStep.y unused
 //   offset 32  u32   pointCount
 //   offset 36  u32   seriesCount
 const VIEW_BYTES = 40;
+
+// Pixels reserved per axis for tick labels: one slot on the left (axis 0) and one
+// per additional axis stacked on the right.
+const PX_PER_AXIS = 55;
 
 // Must match the SUBDIVS constant in lines.wgsl and spline.wgsl.
 const SUBDIVS = 4;
@@ -21,15 +28,19 @@ const SPLINE_PARAMS_BYTES = 16;
 // GridStyle uniform: vec4 color + vec4 bg = 32 bytes; written once at init.
 const STYLE_BYTES = 32;
 
-// ExtentParams uniform: xMin, xMax (f32) + totalY, pointCount (u32) = 16 bytes.
+// ExtentParams uniform: xMin, xMax (f32) + seriesCount, pointCount (u32) = 16 bytes.
 const EXTENT_PARAMS_BYTES = 16;
-// ExtentResult: yMin, yMax (f32) = 8 bytes.
-const EXTENT_RESULT_BYTES = 8;
+
+// GPU axes buffer: 8 floats per axis = 32 bytes.
+// Layout: yScale, yOffset, _pad, _pad, rgba (color for tick labels).
+const AXIS_GPU_BYTES = 32;
 
 // Characters supported by the font atlas (order determines charMeta index).
-const TEXT_CHARS     = '0123456789.-';
-// Max characters across all labels in one frame.
-const TEXT_MAX_CHARS = 512;
+// '█' (U+2588 FULL BLOCK) is used for the per-series color indicators.
+const TEXT_CHARS      = '0123456789.-█';
+const TEXT_MAX_CHARS  = 512;
+// Floats per CharInst: ndcPos(2) + ndcSize(2) + uvMin(2) + uvMax(2) + color(4).
+const TEXT_INST_FLOATS = 12;
 
 export interface HoverInfo {
   point: number;
@@ -66,6 +77,8 @@ export class LineChart {
   private xBuf!:     GPUBuffer;
   private yBuf!:     GPUBuffer;
   private metaBuf!:  GPUBuffer;
+  private axesBuf!:  GPUBuffer;        // per-axis yScale/yOffset/color for lines shader
+  private seriesAxisBuf!: GPUBuffer;   // u32 per series — axis membership for extent shader
 
   private splinePipeline!:    GPUComputePipeline;
   private extentPipeline!:    GPUComputePipeline;
@@ -92,10 +105,13 @@ export class LineChart {
   private atlasH           = 0;
   private textCharCount    = 0;
 
-
-  // View state — data-domain rectangle currently visible.
+  // View state — data-domain X range and per-axis Y ranges.
   private dataMinX = 0; private dataMaxX = 1;
-  private dataMinY = 0; private dataMaxY = 1;
+  private axisMinY!: Float32Array;
+  private axisMaxY!: Float32Array;
+
+  // CPU staging for GPU axes buffer (8 floats per axis).
+  private axesStagingF!: Float32Array<ArrayBuffer>;
 
   private dragging   = false;
   private lastMouseX = 0;
@@ -169,6 +185,11 @@ export class LineChart {
       pixelRatio: options.pixelRatio ?? 1,
       ...(options.onHover !== undefined ? { onHover: options.onHover } : {}),
     };
+
+    this.axisMinY     = new Float32Array(series.axisCount);
+    this.axisMaxY     = new Float32Array(series.axisCount);
+    const axesBacking = new ArrayBuffer(series.axisCount * AXIS_GPU_BYTES);
+    this.axesStagingF = new Float32Array(axesBacking);
   }
 
   // ---- public API ----------------------------------------------------------
@@ -176,27 +197,35 @@ export class LineChart {
   resetView(): void {
     const e    = getExtents(this.series);
     const padX = (e.xMax - e.xMin) * 0.02 || 1;
-    const padY = (e.yMax - e.yMin) * 0.05 || 1;
     this.dataMinX = e.xMin - padX;
     this.dataMaxX = e.xMax + padX;
-    this.dataMinY = e.yMin - padY;
-    this.dataMaxY = e.yMax + padY;
+
+    const axExtents = getAxisCpuExtents(this.series);
+    for (let a = 0; a < this.series.axisCount; a++) {
+      const ae   = axExtents[a]!;
+      const padY = (ae.yMax - ae.yMin) * 0.05 || 1;
+      this.axisMinY[a] = ae.yMin - padY;
+      this.axisMaxY[a] = ae.yMax + padY;
+    }
+
     const dpr = this.opts.pixelRatio;
     const w   = Math.max(1, Math.floor(this.cssWidth  * dpr));
     const h   = Math.max(1, Math.floor(this.cssHeight * dpr));
+    this.uploadAxes();
     this.writeViewAll(w, h);
     this.viewInitialized = true;
     this.updateLabels();
-    this.requestExtent();
+    this.requestAxisExtents();
     this.requestRender();
   }
 
   setData(series: SeriesBufferView): void {
     if (
       series.seriesCount !== this.series.seriesCount ||
-      series.pointCount  !== this.series.pointCount
+      series.pointCount  !== this.series.pointCount  ||
+      series.axisCount   !== this.series.axisCount
     ) {
-      throw new Error('setData: series/point shape must match');
+      throw new Error('setData: series/point/axis shape must match');
     }
     this.series = series;
     this.uploadData();
@@ -218,19 +247,22 @@ export class LineChart {
   private buildResources(gridMod: GPUShaderModule, lineMod: GPUShaderModule, splineMod: GPUShaderModule, extentMod: GPUShaderModule, textMod: GPUShaderModule): void {
     const { device, series } = this;
 
-    const totalSamples = SUBDIVS * (series.pointCount - 1) + 1;
+    const totalSamples      = SUBDIVS * (series.pointCount - 1) + 1;
+    const extentResultBytes = series.axisCount * 8;
 
     // Data buffers.
-    this.viewBuf         = device.createBuffer({ label: 'view',          size: VIEW_BYTES,                             usage: GPUBufferUsage.UNIFORM  | GPUBufferUsage.COPY_DST });
-    this.styleBuf        = device.createBuffer({ label: 'style',         size: STYLE_BYTES,                            usage: GPUBufferUsage.UNIFORM  | GPUBufferUsage.COPY_DST });
-    this.xBuf            = device.createBuffer({ label: 'x',             size: series.x.byteLength,                    usage: GPUBufferUsage.STORAGE  | GPUBufferUsage.COPY_DST });
-    this.yBuf            = device.createBuffer({ label: 'y',             size: series.y.byteLength,                    usage: GPUBufferUsage.STORAGE  | GPUBufferUsage.COPY_DST });
-    this.metaBuf         = device.createBuffer({ label: 'meta',          size: series.meta.byteLength,                 usage: GPUBufferUsage.STORAGE  | GPUBufferUsage.COPY_DST });
-    this.splineParamsBuf = device.createBuffer({ label: 'spline-params', size: SPLINE_PARAMS_BYTES,                    usage: GPUBufferUsage.UNIFORM  | GPUBufferUsage.COPY_DST });
-    this.splineBuf          = device.createBuffer({ label: 'spline',          size: series.seriesCount * totalSamples * 8, usage: GPUBufferUsage.STORAGE });
-    this.extentParamsBuf    = device.createBuffer({ label: 'extent-params',   size: EXTENT_PARAMS_BYTES,                   usage: GPUBufferUsage.UNIFORM  | GPUBufferUsage.COPY_DST });
-    this.extentResultBuf    = device.createBuffer({ label: 'extent-result',   size: EXTENT_RESULT_BYTES,                   usage: GPUBufferUsage.STORAGE  | GPUBufferUsage.COPY_SRC });
-    this.extentReadbackBuf  = device.createBuffer({ label: 'extent-readback', size: EXTENT_RESULT_BYTES,                   usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    this.viewBuf         = device.createBuffer({ label: 'view',          size: VIEW_BYTES,                              usage: GPUBufferUsage.UNIFORM  | GPUBufferUsage.COPY_DST });
+    this.styleBuf        = device.createBuffer({ label: 'style',         size: STYLE_BYTES,                             usage: GPUBufferUsage.UNIFORM  | GPUBufferUsage.COPY_DST });
+    this.xBuf            = device.createBuffer({ label: 'x',             size: series.x.byteLength,                     usage: GPUBufferUsage.STORAGE  | GPUBufferUsage.COPY_DST });
+    this.yBuf            = device.createBuffer({ label: 'y',             size: series.y.byteLength,                     usage: GPUBufferUsage.STORAGE  | GPUBufferUsage.COPY_DST });
+    this.metaBuf         = device.createBuffer({ label: 'meta',          size: series.meta.byteLength,                  usage: GPUBufferUsage.STORAGE  | GPUBufferUsage.COPY_DST });
+    this.axesBuf         = device.createBuffer({ label: 'axes',          size: series.axisCount * AXIS_GPU_BYTES,       usage: GPUBufferUsage.STORAGE  | GPUBufferUsage.COPY_DST });
+    this.seriesAxisBuf   = device.createBuffer({ label: 'series-axis',   size: series.seriesCount * 4,                  usage: GPUBufferUsage.STORAGE  | GPUBufferUsage.COPY_DST });
+    this.splineParamsBuf = device.createBuffer({ label: 'spline-params', size: SPLINE_PARAMS_BYTES,                     usage: GPUBufferUsage.UNIFORM  | GPUBufferUsage.COPY_DST });
+    this.splineBuf          = device.createBuffer({ label: 'spline',          size: series.seriesCount * totalSamples * 8,  usage: GPUBufferUsage.STORAGE });
+    this.extentParamsBuf    = device.createBuffer({ label: 'extent-params',   size: EXTENT_PARAMS_BYTES,                    usage: GPUBufferUsage.UNIFORM  | GPUBufferUsage.COPY_DST });
+    this.extentResultBuf    = device.createBuffer({ label: 'extent-result',   size: extentResultBytes,                      usage: GPUBufferUsage.STORAGE  | GPUBufferUsage.COPY_SRC });
+    this.extentReadbackBuf  = device.createBuffer({ label: 'extent-readback', size: extentResultBytes,                      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
 
     this.uploadData();
 
@@ -304,6 +336,7 @@ export class LineChart {
         { binding: 1, resource: { buffer: this.xBuf             } },
         { binding: 2, resource: { buffer: this.yBuf             } },
         { binding: 3, resource: { buffer: this.extentResultBuf  } },
+        { binding: 4, resource: { buffer: this.seriesAxisBuf    } },
       ],
     });
 
@@ -313,6 +346,7 @@ export class LineChart {
         { binding: 0, resource: { buffer: this.viewBuf   } },
         { binding: 1, resource: { buffer: this.splineBuf } },
         { binding: 2, resource: { buffer: this.metaBuf   } },
+        { binding: 3, resource: { buffer: this.axesBuf   } },
       ],
     });
 
@@ -321,7 +355,7 @@ export class LineChart {
 
     this.textInstBuf = device.createBuffer({
       label: 'text-inst',
-      size:  TEXT_MAX_CHARS * 8 * 4,  // 8 floats × 4 bytes per char
+      size:  TEXT_MAX_CHARS * TEXT_INST_FLOATS * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
 
@@ -359,7 +393,6 @@ export class LineChart {
     const font  = '12px monospace';
     const pad   = 1;
 
-    // Measure each character using a throw-away canvas.
     const mCanvas = document.createElement('canvas');
     mCanvas.width  = 1;
     mCanvas.height = 1;
@@ -371,7 +404,6 @@ export class LineChart {
 
     const slotWidths = Array.from(TEXT_CHARS).map(c => Math.ceil(mctx.measureText(c).width) + pad * 2);
     const totalW     = slotWidths.reduce((a, b) => a + b, 0);
-    // bytesPerRow must be multiple of 256; with rgba8unorm that means width % 64 === 0.
     const texW       = Math.ceil(totalW / 64) * 64;
 
     const aCanvas = document.createElement('canvas');
@@ -413,8 +445,6 @@ export class LineChart {
     });
   }
 
-  // Dispatch the compute shader to evaluate the Catmull-Rom spline into
-  // splineBuf. Called once at init and again whenever data changes.
   private bakeSpline(): void {
     const totalSamples = SUBDIVS * (this.series.pointCount - 1) + 1;
     const params = new Uint32Array(4);
@@ -439,6 +469,35 @@ export class LineChart {
     this.device.queue.writeBuffer(this.xBuf,    0, this.series.x);
     this.device.queue.writeBuffer(this.yBuf,    0, this.series.y);
     this.device.queue.writeBuffer(this.metaBuf, 0, this.series.meta);
+    this.uploadSeriesAxis();
+  }
+
+  private uploadSeriesAxis(): void {
+    const buf = new Uint32Array(this.series.seriesCount);
+    for (let s = 0; s < this.series.seriesCount; s++) {
+      buf[s] = getSeriesAxis(this.series, s);
+    }
+    this.device.queue.writeBuffer(this.seriesAxisBuf, 0, buf);
+  }
+
+  // Upload the per-axis GPU buffer (yScale, yOffset, color) from current axisMinY/axisMaxY.
+  private uploadAxes(): void {
+    for (let a = 0; a < this.series.axisCount; a++) {
+      const yMin  = this.axisMinY[a]!;
+      const yMax  = this.axisMaxY[a]!;
+      const range = yMax - yMin || 1;
+      const o = a * 8;
+      this.axesStagingF[o + 0] = 2 / range;                  // yScale
+      this.axesStagingF[o + 1] = (yMin + yMax) * 0.5;        // yOffset
+      this.axesStagingF[o + 2] = 0;                           // _pad
+      this.axesStagingF[o + 3] = 0;                           // _pad
+      const c = getAxisColor(this.series, a);
+      this.axesStagingF[o + 4] = c[0];
+      this.axesStagingF[o + 5] = c[1];
+      this.axesStagingF[o + 6] = c[2];
+      this.axesStagingF[o + 7] = c[3];
+    }
+    this.device.queue.writeBuffer(this.axesBuf, 0, this.axesStagingF);
   }
 
   private attachEvents(): void {
@@ -449,7 +508,7 @@ export class LineChart {
         const dpr = this.opts.pixelRatio;
         const w   = Math.max(1, Math.floor(this.cssWidth  * dpr));
         const h   = Math.max(1, Math.floor(this.cssHeight * dpr));
-        this.writeViewViewportStep(w, h);
+        this.writeViewAll(w, h);
       }
       this.updateLabels();
       this.requestRender();
@@ -463,7 +522,7 @@ export class LineChart {
       this.canvas.style.cursor = 'grabbing';
     });
     window.addEventListener('mouseup', () => {
-      if (this.dragging) this.requestExtent();
+      if (this.dragging) this.requestAxisExtents();
       this.dragging = false;
       this.canvas.style.cursor = '';
     });
@@ -477,7 +536,7 @@ export class LineChart {
       e.preventDefault();
       const rect   = this.canvas.getBoundingClientRect();
       const factor = Math.exp(-e.deltaY * 0.0015);
-      this.zoomAt(e.clientX - rect.left, e.clientY - rect.top, factor);
+      this.zoomAt(e.clientX - rect.left, factor);
     }, { passive: false });
     this.canvas.addEventListener('dblclick', () => this.resetView());
 
@@ -495,13 +554,15 @@ export class LineChart {
   }
 
   private pickX(cssX: number): void {
-    const dataX = this.dataMinX + (cssX / this.cssWidth) * (this.dataMaxX - this.dataMinX);
+    const leftPx  = this.gutterLeft();
+    const rightPx = this.gutterRight();
+    const plotW   = Math.max(1, this.cssWidth - leftPx - rightPx);
+    const dataX   = this.dataMinX + (Math.max(0, cssX - leftPx) / plotW) * (this.dataMaxX - this.dataMinX);
     const x = this.series.x;
     const N = this.series.pointCount;
 
     let lo = 0, hi = N;
     while (lo < hi) { const m = (lo + hi) >>> 1; if (x[m]! < dataX) lo = m + 1; else hi = m; }
-    // lo is first index where x[lo] >= dataX; check lo and lo-1
     const i = (lo > 0 && lo < N && Math.abs(x[lo - 1]! - dataX) <= Math.abs(x[lo]! - dataX))
       ? lo - 1
       : Math.min(lo, N - 1);
@@ -518,28 +579,53 @@ export class LineChart {
 
   // ---- view math -----------------------------------------------------------
 
+  // All axes stack on the left; no right gutter.
+  private gutterLeft():  number { return this.series.axisCount * PX_PER_AXIS; }
+  private gutterRight(): number { return 0; }
+
+  // Gutter-aware X scale/offset: the data range maps to the plot sub-rectangle, not the
+  // full canvas. By folding the gutter into scale/offset, no shader changes are needed.
+  private computeXScaleOffset(): { scaleX: number; offsetX: number } {
+    const w      = this.cssWidth;
+    const left   = this.gutterLeft();
+    const right  = this.gutterRight();
+    const plotW  = Math.max(1, w - left - right);
+    const range  = this.dataMaxX - this.dataMinX || 1;
+    const scaleX = (plotW / w) * 2 / range;
+    const centre = (this.dataMinX + this.dataMaxX) * 0.5;
+    // Canvas-NDC centre of the plot area.
+    const plotCentreNDC = 2 * (left + plotW * 0.5) / w - 1;
+    // Absorb the NDC translation into offset so the shader formula (pos-offset)*scale is unchanged.
+    const offsetX = centre - plotCentreNDC / scaleX;
+    return { scaleX, offsetX };
+  }
+
   private panByCssPixels(dxCss: number): void {
-    const dx = (dxCss / this.cssWidth) * (this.dataMaxX - this.dataMinX);
+    const leftPx  = this.gutterLeft();
+    const rightPx = this.gutterRight();
+    const plotW   = Math.max(1, this.cssWidth - leftPx - rightPx);
+    const dx = (dxCss / plotW) * (this.dataMaxX - this.dataMinX);
     this.dataMinX -= dx; this.dataMaxX -= dx;
     this.writeViewOffset();
     this.updateLabels();
     this.requestRender();
   }
 
-  private zoomAt(cssX: number, _cssY: number, factor: number): void {
-    const fx = cssX / this.cssWidth;
+  private zoomAt(cssX: number, factor: number): void {
+    const leftPx  = this.gutterLeft();
+    const rightPx = this.gutterRight();
+    const plotW   = Math.max(1, this.cssWidth - leftPx - rightPx);
+    const fx = Math.max(0, cssX - leftPx) / plotW;
     const ax = this.dataMinX + fx * (this.dataMaxX - this.dataMinX);
     this.dataMinX = ax + (this.dataMinX - ax) / factor;
     this.dataMaxX = ax + (this.dataMaxX - ax) / factor;
     this.writeViewScaleOffsetStep();
     this.updateLabels();
-    this.requestExtent();
+    this.requestAxisExtents();
     this.requestRender();
   }
 
   // ---- uniform helpers -----------------------------------------------------
-  // The staging ArrayBuffer is a CPU mirror of viewBuf, kept current by every
-  // write helper so that partial writes can read unchanged bytes from staging.
 
   private viewStaging  = new ArrayBuffer(VIEW_BYTES);
   private viewStagingF = new Float32Array(this.viewStaging);
@@ -549,47 +635,40 @@ export class LineChart {
   private extentParamsF = new Float32Array(this.extentParams);
   private extentParamsU = new Uint32Array(this.extentParams);
 
-  // Drag: only the offset (data-domain centre) changes.
+  // Drag: only the X offset changes.
   private writeViewOffset(): void {
+    const { offsetX } = this.computeXScaleOffset();
     const f = this.viewStagingF;
-    f[2] = (this.dataMinX + this.dataMaxX) * 0.5;
-    f[3] = (this.dataMinY + this.dataMaxY) * 0.5;
+    f[2] = offsetX;
+    f[3] = 0; // scale.y/offset.y unused (per-axis Y handled in axesBuf)
     this.device.queue.writeBuffer(this.viewBuf, 8, this.viewStaging, 8, 8);
   }
 
   // Zoom: scale, offset, and gridStep change; viewport stays.
   private writeViewScaleOffsetStep(): void {
+    const { scaleX, offsetX } = this.computeXScaleOffset();
     const f = this.viewStagingF;
-    f[0] = 2 / (this.dataMaxX - this.dataMinX);
-    f[1] = 2 / (this.dataMaxY - this.dataMinY);
-    f[2] = (this.dataMinX + this.dataMaxX) * 0.5;
-    f[3] = (this.dataMinY + this.dataMaxY) * 0.5;
-    // f[4], f[5] (viewport) remain current in staging from last writeViewAll/writeViewViewportStep
-    f[6] = niceStep(this.dataMaxX - this.dataMinX, this.cssWidth,  100);
-    f[7] = niceStep(this.dataMaxY - this.dataMinY, this.cssHeight, 80);
+    f[0] = scaleX;
+    f[1] = 0; // scale.y unused
+    f[2] = offsetX;
+    f[3] = 0; // offset.y unused
+    f[6] = niceStep(this.dataMaxX - this.dataMinX, this.cssWidth, 100);
+    f[7] = 0; // gridStep.y unused (no Y grid lines)
     this.device.queue.writeBuffer(this.viewBuf, 0, this.viewStaging, 0, 32);
   }
 
-  // Resize: viewport and gridStep change; scale and offset stay.
-  private writeViewViewportStep(w: number, h: number): void {
-    const f = this.viewStagingF;
-    f[4] = w; f[5] = h;
-    f[6] = niceStep(this.dataMaxX - this.dataMinX, this.cssWidth,  100);
-    f[7] = niceStep(this.dataMaxY - this.dataMinY, this.cssHeight, 80);
-    this.device.queue.writeBuffer(this.viewBuf, 16, this.viewStaging, 16, 16);
-  }
-
-  // Init / reset / setData: write the full 40-byte struct.
+  // Init / reset / resize: write the full 40-byte struct.
   private writeViewAll(w: number, h: number): void {
+    const { scaleX, offsetX } = this.computeXScaleOffset();
     const f = this.viewStagingF;
     const u = this.viewStagingU;
-    f[0] = 2 / (this.dataMaxX - this.dataMinX);
-    f[1] = 2 / (this.dataMaxY - this.dataMinY);
-    f[2] = (this.dataMinX + this.dataMaxX) * 0.5;
-    f[3] = (this.dataMinY + this.dataMaxY) * 0.5;
+    f[0] = scaleX;
+    f[1] = 0;
+    f[2] = offsetX;
+    f[3] = 0;
     f[4] = w; f[5] = h;
-    f[6] = niceStep(this.dataMaxX - this.dataMinX, this.cssWidth,  100);
-    f[7] = niceStep(this.dataMaxY - this.dataMinY, this.cssHeight, 80);
+    f[6] = niceStep(this.dataMaxX - this.dataMinX, this.cssWidth, 100);
+    f[7] = 0;
     u[8] = this.series.pointCount;
     u[9] = this.series.seriesCount;
     this.device.queue.writeBuffer(this.viewBuf, 0, this.viewStaging);
@@ -597,46 +676,47 @@ export class LineChart {
 
   // ---- extent compute + Y autoscale ----------------------------------------
 
-  private requestExtent(): void {
+  private requestAxisExtents(): void {
     if (this.extentInFlight) { this.extentDirty = true; return; }
     this.extentInFlight = true;
     this.extentDirty    = false;
 
-    const totalY = this.series.seriesCount * this.series.pointCount;
     this.extentParamsF[0] = this.dataMinX;
     this.extentParamsF[1] = this.dataMaxX;
-    this.extentParamsU[2] = totalY;
+    this.extentParamsU[2] = this.series.seriesCount;
     this.extentParamsU[3] = this.series.pointCount;
     this.device.queue.writeBuffer(this.extentParamsBuf, 0, this.extentParams);
 
+    const resultBytes = this.series.axisCount * 8;
     const enc = this.device.createCommandEncoder();
     const cp  = enc.beginComputePass();
     cp.setPipeline(this.extentPipeline);
     cp.setBindGroup(0, this.extentBind);
-    cp.dispatchWorkgroups(1);
+    cp.dispatchWorkgroups(this.series.axisCount); // one workgroup per axis
     cp.end();
-    enc.copyBufferToBuffer(this.extentResultBuf, 0, this.extentReadbackBuf, 0, EXTENT_RESULT_BYTES);
+    enc.copyBufferToBuffer(this.extentResultBuf, 0, this.extentReadbackBuf, 0, resultBytes);
     this.device.queue.submit([enc.finish()]);
 
     this.extentReadbackBuf.mapAsync(GPUMapMode.READ).then(() => {
-      const arr  = new Float32Array(this.extentReadbackBuf.getMappedRange());
-      const yMin = arr[0]!;
-      const yMax = arr[1]!;
+      const arr = new Float32Array(this.extentReadbackBuf.getMappedRange());
+      const results = arr.slice(); // copy before unmap
       this.extentReadbackBuf.unmap();
       this.extentInFlight = false;
-      this.applyAutoscaleY(yMin, yMax);
-      if (this.extentDirty) this.requestExtent();
+      for (let a = 0; a < this.series.axisCount; a++) {
+        this.applyAxisAutoscale(a, results[a * 2]!, results[a * 2 + 1]!);
+      }
+      if (this.extentDirty) this.requestAxisExtents();
     }).catch(() => {
       this.extentInFlight = false;
     });
   }
 
-  private applyAutoscaleY(yMin: number, yMax: number): void {
+  private applyAxisAutoscale(a: number, yMin: number, yMax: number): void {
     if (!isFinite(yMin) || !isFinite(yMax) || yMax <= yMin) return;
     const pad = (yMax - yMin) * 0.05 || 0.5;
-    this.dataMinY = yMin - pad;
-    this.dataMaxY = yMax + pad;
-    this.writeViewScaleOffsetStep();
+    this.axisMinY[a] = yMin - pad;
+    this.axisMaxY[a] = yMax + pad;
+    this.uploadAxes();
     this.updateLabels();
     this.requestRender();
   }
@@ -649,13 +729,15 @@ export class LineChart {
     const w     = this.cssWidth;
     const h     = this.cssHeight;
     const stepX = this.viewStagingF[6]!;
-    const stepY = this.viewStagingF[7]!;
 
-    const inst = new Float32Array(TEXT_MAX_CHARS * 8);
+    const leftPx  = this.gutterLeft();
+    const rightPx = this.gutterRight();
+    const plotW   = Math.max(1, w - leftPx - rightPx);
+
+    const inst = new Float32Array(TEXT_MAX_CHARS * TEXT_INST_FLOATS);
     let count  = 0;
 
-    // Emit one CharInst per character at the given cursor position.
-    const emitChar = (c: string, curX: number, topY: number) => {
+    const emitChar = (c: string, curX: number, topY: number, color: readonly [number, number, number, number]): number => {
       if (count >= TEXT_MAX_CHARS) return 0;
       const idx = TEXT_CHARS.indexOf(c);
       if (idx < 0) return 0;
@@ -664,17 +746,18 @@ export class LineChart {
       const ndcY = 1 - (topY / h) * 2;
       const ndcW = (m.width / w) * 2;
       const ndcH = (this.atlasH / h) * 2;
-      const off  = count * 8;
-      inst[off]   = ndcX;  inst[off+1] = ndcY;
-      inst[off+2] = ndcW;  inst[off+3] = ndcH;
-      inst[off+4] = m.uMin; inst[off+5] = 0;
-      inst[off+6] = m.uMax; inst[off+7] = 1;
+      const off  = count * TEXT_INST_FLOATS;
+      inst[off]    = ndcX;     inst[off+1]  = ndcY;
+      inst[off+2]  = ndcW;     inst[off+3]  = ndcH;
+      inst[off+4]  = m.uMin;   inst[off+5]  = 0;
+      inst[off+6]  = m.uMax;   inst[off+7]  = 1;
+      inst[off+8]  = color[0]; inst[off+9]  = color[1];
+      inst[off+10] = color[2]; inst[off+11] = color[3];
       count++;
       return m.width;
     };
 
-    // Emit a full label string, horizontally centered around anchorX if centerX.
-    const emitLabel = (text: string, anchorX: number, anchorY: number, centerX: boolean) => {
+    const emitLabel = (text: string, anchorX: number, anchorY: number, centerX: boolean, color: readonly [number, number, number, number]) => {
       let totalW = 0;
       for (const c of text) {
         const idx = TEXT_CHARS.indexOf(c);
@@ -682,38 +765,73 @@ export class LineChart {
       }
       let curX = centerX ? anchorX - totalW / 2 : anchorX;
       const topY = anchorY - this.atlasH / 2;
-      for (const c of text) curX += emitChar(c, curX, topY);
+      for (const c of text) curX += emitChar(c, curX, topY, color);
     };
 
-    if (stepX > 0 && w > 0) {
+    const white = [1, 1, 1, 1] as const;
+
+    // X ticks — positioned within the plot area.
+    if (stepX > 0 && plotW > 0) {
       const first = Math.ceil(this.dataMinX / stepX) * stepX;
       for (let v = first; v < this.dataMaxX + stepX * 1e-6; v += stepX) {
-        const px = (v - this.dataMinX) / (this.dataMaxX - this.dataMinX) * w;
-        if (px < 0 || px > w) continue;
-        emitLabel(formatTick(v, stepX), px, h - this.atlasH / 2 - 4, true);
+        const px = leftPx + (v - this.dataMinX) / (this.dataMaxX - this.dataMinX) * plotW;
+        if (px < leftPx || px > w - rightPx) continue;
+        emitLabel(formatTick(v, stepX), px, h - this.atlasH / 2 - 4, true, white);
       }
     }
 
-    if (stepY > 0 && h > 0) {
-      const first = Math.ceil(this.dataMinY / stepY) * stepY;
-      for (let v = first; v < this.dataMaxY + stepY * 1e-6; v += stepY) {
-        const py = (1 - (v - this.dataMinY) / (this.dataMaxY - this.dataMinY)) * h;
+    // Y ticks — one column per axis, all on the left.
+    // Axis 0 is innermost (closest to plot); axis N-1 is outermost.
+    for (let a = 0; a < this.series.axisCount; a++) {
+      const yMin   = this.axisMinY[a]!;
+      const yMax   = this.axisMaxY[a]!;
+      const yRange = yMax - yMin;
+      if (yRange <= 0) continue;
+
+      const stepY = niceStep(yRange, h, 80);
+      if (stepY <= 0) continue;
+
+      // Column for axis a: axis 0 is innermost (rightmost of the left gutters).
+      const colLeft = (this.series.axisCount - 1 - a) * PX_PER_AXIS;
+      const labelX  = colLeft + 4;
+
+      // Tick labels in white.
+      const first = Math.ceil(yMin / stepY) * stepY;
+      for (let v = first; v < yMax + stepY * 1e-6; v += stepY) {
+        const py = (1 - (v - yMin) / yRange) * h;
         if (py < 0 || py > h) continue;
-        emitLabel(formatTick(v, stepY), 6, py, false);
+        emitLabel(formatTick(v, stepY), labelX, py, false, white);
+      }
+
+      // Colored squares at the top of the column — one per series on this axis.
+      const sqIdx = TEXT_CHARS.indexOf('█');
+      const sqW   = sqIdx >= 0 ? this.charMeta[sqIdx]!.width : 8;
+      const colCenterX = colLeft + PX_PER_AXIS / 2;
+      const srcs: number[] = [];
+      for (let s = 0; s < this.series.seriesCount; s++) {
+        if (getSeriesAxis(this.series, s) === a) srcs.push(s);
+      }
+      let sqX = colCenterX - (srcs.length * sqW) / 2;
+      for (const s of srcs) {
+        const color = [
+          this.series.meta[s * 8 + 0]!,
+          this.series.meta[s * 8 + 1]!,
+          this.series.meta[s * 8 + 2]!,
+          1,
+        ] as const;
+        emitChar('█', sqX, 4, color);
+        sqX += sqW;
       }
     }
 
     this.textCharCount = count;
     if (count > 0) {
-      this.device.queue.writeBuffer(this.textInstBuf, 0, inst, 0, count * 8);
+      this.device.queue.writeBuffer(this.textInstBuf, 0, inst, 0, count * TEXT_INST_FLOATS);
     }
   }
 
   // ---- visible sample range ------------------------------------------------
 
-  // Binary-search series.x (monotone) to find which spline samples are on screen.
-  // Returns [firstSample, lastSample] with one-segment margin for tangent accuracy.
-  // Assumes X is sorted; true for all data generated by data.ts.
   private visibleSamples(): [number, number] {
     const x   = this.series.x;
     const N   = this.series.pointCount;

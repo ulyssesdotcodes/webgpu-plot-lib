@@ -1,41 +1,44 @@
-import { type SeriesBufferView, createSeriesBuffer, setStyle, recomputeExtents } from './format.js';
+import { type SeriesBufferView, createSeriesBuffer, setStyle, setAxisConfig, recomputeExtents } from './format.js';
 
-// Small library of generators that produce a fully-populated SeriesBuffer for
-// the demo / tests. They write directly into the typed-array views the format
-// hands out — no intermediate copies — so the same buffer can be transferred
-// to a worker afterward without restructuring.
+// generateLines — groups[a] = series count for axis a.  Each axis group gets a
+// different amplitude scale so independent Y ranges are obvious in the demo.
+export function generateLines(groups: number[], pointCount: number): SeriesBufferView {
+  const sb = createSeriesBuffer(groups, pointCount);
+  const totalSeries = sb.seriesCount;
 
-export function generateLines(seriesCount: number, pointCount: number): SeriesBufferView {
-  const sb = createSeriesBuffer(seriesCount, pointCount);
-
-  // X axis: dense uniform grid 0..1 (thousands to millions of points are fine).
   for (let i = 0; i < pointCount; i++) {
     sb.x[i] = i / (pointCount - 1);
   }
 
-  for (let s = 0; s < seriesCount; s++) {
-    const phase = (s / seriesCount) * Math.PI * 2;
-    const freq  = 1 + s * 0.7;
-    const amp   = 0.7 + Math.random() * 0.4;
-    const drift = (s - seriesCount / 2) * 0.4;
+  let s = 0;
+  for (let a = 0; a < groups.length; a++) {
+    const groupAmp = Math.pow(10, a * 2); // axis 0: ±1, axis 1: ±100, axis 2: ±10000 …
 
-    let walk = 0;
-    for (let i = 0; i < pointCount; i++) {
-      const t = sb.x[i]!;
-      walk += (Math.random() - 0.5) * 0.05;
-      sb.y[s * pointCount + i] = drift + amp * Math.sin(phase + freq * t * Math.PI * 2) + walk;
+    for (let g = 0; g < groups[a]!; g++, s++) {
+      const phase = (s / totalSeries) * Math.PI * 2;
+      const freq  = 1 + s * 0.7;
+      const amp   = groupAmp * (0.7 + Math.random() * 0.4);
+      const drift = (g - groups[a]! / 2) * groupAmp * 0.4;
+
+      let walk = 0;
+      for (let i = 0; i < pointCount; i++) {
+        const t = sb.x[i]!;
+        walk += (Math.random() - 0.5) * 0.05 * groupAmp;
+        sb.y[s * pointCount + i] = drift + amp * Math.sin(phase + freq * t * Math.PI * 2) + walk;
+      }
+
+      const hue = s / totalSeries;
+      const [r, gr, b] = hslToRgb(hue, 0.7, 0.6);
+      setStyle(sb, s, { color: [r, gr, b, 1], width: 2.5 });
+
+      if (g === 0) setAxisConfig(sb, a, { color: [r, gr, b, 1] });
     }
-
-    const hue = s / seriesCount;
-    const [r, g, b] = hslToRgb(hue, 0.7, 0.6);
-    setStyle(sb, s, { color: [r, g, b, 1], width: 2.5 });
   }
 
   recomputeExtents(sb);
   return sb;
 }
 
-// Kept from the previous scaffold so the original points demo still has data.
 export function generateClusters(
   clusterCount: number,
   pointsPerCluster: number,
@@ -43,7 +46,7 @@ export function generateClusters(
 ): { positions: Float32Array<ArrayBuffer>; colors: Float32Array<ArrayBuffer>; count: number } {
   const count = clusterCount * pointsPerCluster;
   const positions: Float32Array<ArrayBuffer> = new Float32Array(count * 2);
-  const colors: Float32Array<ArrayBuffer> = new Float32Array(count * 4);
+  const colors: Float32Array<ArrayBuffer>    = new Float32Array(count * 4);
 
   for (let c = 0; c < clusterCount; c++) {
     const cx = Math.random() * 1.6 - 0.8;
