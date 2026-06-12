@@ -1,4 +1,4 @@
-import { type SeriesBufferView, createSeriesBuffer, setStyle, setAxisConfig, recomputeExtents } from './format.js';
+import { type SeriesBufferView, type PointShape, createSeriesBuffer, setStyle, setAxisConfig, recomputeExtents } from './format.js';
 
 // generateLines — groups[a] = series count for axis a.  Each axis group gets a
 // different amplitude scale so independent Y ranges are obvious in the demo.
@@ -29,7 +29,11 @@ export function generateLines(groups: number[], pointCount: number): SeriesBuffe
 
       const hue = s / totalSeries;
       const [r, gr, b] = hslToRgb(hue, 0.7, 0.6);
-      setStyle(sb, s, { color: [r, gr, b, 1], width: 2.5 });
+
+      const POINT_SHAPES: PointShape[] = ['circle', 'triangle', 'square'];
+      const hasPoints = g === 0;
+      const points = hasPoints ? { size: 5, shape: POINT_SHAPES[a % POINT_SHAPES.length]! } : undefined;
+      setStyle(sb, s, { color: [r, gr, b, 1], width: hasPoints ? 0 : 2.5, ...(points !== undefined ? { points } : {}) });
 
       if (g === 0) setAxisConfig(sb, a, { color: [r, gr, b, 1] });
     }

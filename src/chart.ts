@@ -95,6 +95,11 @@ export class LineChart {
   private extentReadbackBuf!: GPUBuffer;
   private extentInFlight      = false;
   private extentDirty         = false;
+  private pointSeriesIndices: number[] = [];
+  private lineSeriesIndices:  number[] = [];
+
+  private pointPipeline!:  GPURenderPipeline;
+  private pointBind!:      GPUBindGroup;
 
   private textPipeline!:   GPURenderPipeline;
   private textBind!:       GPUBindGroup;
@@ -102,6 +107,7 @@ export class LineChart {
   private atlasTexture!:   GPUTexture;
   private atlasSampler!:   GPUSampler;
   private charMeta:        Array<{ uMin: number; uMax: number; width: number }> = [];
+  private charIndex        = new Map<string, number>();
   private atlasH           = 0;
   private textCharCount    = 0;
 
@@ -112,6 +118,10 @@ export class LineChart {
 
   // CPU staging for GPU axes buffer (8 floats per axis).
   private axesStagingF!: Float32Array<ArrayBuffer>;
+
+  private resizeObserver!:    ResizeObserver;
+  private onWindowMouseUp!:   () => void;
+  private onWindowMouseMove!: (e: MouseEvent) => void;
 
   private dragging   = false;
   private lastMouseX = 0;
@@ -151,16 +161,17 @@ export class LineChart {
     const format = navigator.gpu.getPreferredCanvasFormat();
     context.configure({ device, format, alphaMode: 'opaque' });
 
-    const [grid, lines, spline, extent, text] = await Promise.all([
+    const [grid, lines, spline, extent, text, points] = await Promise.all([
       fetchShader(device, '/shaders/grid.wgsl',   'grid'),
       fetchShader(device, '/shaders/lines.wgsl',  'lines'),
       fetchShader(device, '/shaders/spline.wgsl', 'spline'),
       fetchShader(device, '/shaders/extent.wgsl', 'extent'),
       fetchShader(device, '/shaders/text.wgsl',   'text'),
+      fetchShader(device, '/shaders/points.wgsl', 'points'),
     ]);
 
     const chart = new LineChart(canvas, context, device, format, series, options);
-    chart.buildResources(grid, lines, spline, extent, text);
+    chart.buildResources(grid, lines, spline, extent, text, points);
     chart.attachEvents();
     chart.resetView();
     return chart;
@@ -242,9 +253,16 @@ export class LineChart {
     });
   }
 
+  destroy(): void {
+    this.resizeObserver.disconnect();
+    window.removeEventListener('mouseup',    this.onWindowMouseUp);
+    window.removeEventListener('mousemove',  this.onWindowMouseMove);
+    this.device.destroy();
+  }
+
   // ---- setup ---------------------------------------------------------------
 
-  private buildResources(gridMod: GPUShaderModule, lineMod: GPUShaderModule, splineMod: GPUShaderModule, extentMod: GPUShaderModule, textMod: GPUShaderModule): void {
+  private buildResources(gridMod: GPUShaderModule, lineMod: GPUShaderModule, splineMod: GPUShaderModule, extentMod: GPUShaderModule, textMod: GPUShaderModule, pointMod: GPUShaderModule): void {
     const { device, series } = this;
 
     const totalSamples      = SUBDIVS * (series.pointCount - 1) + 1;
@@ -310,6 +328,23 @@ export class LineChart {
       primitive: { topology: 'triangle-strip' },
     });
 
+    this.pointPipeline = device.createRenderPipeline({
+      label:  'points',
+      layout: 'auto',
+      vertex:   { module: pointMod, entryPoint: 'vs' },
+      fragment: {
+        module: pointMod, entryPoint: 'fs',
+        targets: [{
+          format: this.format,
+          blend: {
+            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one',       dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          },
+        }],
+      },
+      primitive: { topology: 'triangle-list' },
+    });
+
     // Bind groups.
     this.splineBind = device.createBindGroup({
       layout: this.splinePipeline.getBindGroupLayout(0),
@@ -347,6 +382,17 @@ export class LineChart {
         { binding: 1, resource: { buffer: this.splineBuf } },
         { binding: 2, resource: { buffer: this.metaBuf   } },
         { binding: 3, resource: { buffer: this.axesBuf   } },
+      ],
+    });
+
+    this.pointBind = device.createBindGroup({
+      layout: this.pointPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.viewBuf } },
+        { binding: 1, resource: { buffer: this.xBuf    } },
+        { binding: 2, resource: { buffer: this.yBuf    } },
+        { binding: 3, resource: { buffer: this.metaBuf } },
+        { binding: 4, resource: { buffer: this.axesBuf } },
       ],
     });
 
@@ -415,11 +461,13 @@ export class LineChart {
     ctx.textBaseline = 'middle';
 
     let x = 0;
-    this.charMeta = [];
+    this.charMeta  = [];
+    this.charIndex = new Map();
     for (let i = 0; i < TEXT_CHARS.length; i++) {
       const w = slotWidths[i]!;
       ctx.fillText(TEXT_CHARS[i]!, x + pad, this.atlasH / 2);
       this.charMeta.push({ uMin: x / texW, uMax: (x + w) / texW, width: w });
+      this.charIndex.set(TEXT_CHARS[i]!, i);
       x += w;
     }
 
@@ -470,6 +518,12 @@ export class LineChart {
     this.device.queue.writeBuffer(this.yBuf,    0, this.series.y);
     this.device.queue.writeBuffer(this.metaBuf, 0, this.series.meta);
     this.uploadSeriesAxis();
+    this.pointSeriesIndices = [];
+    this.lineSeriesIndices  = [];
+    for (let s = 0; s < this.series.seriesCount; s++) {
+      if (this.series.meta[s * 12 + 7]! > 0) this.pointSeriesIndices.push(s);
+      if (this.series.meta[s * 12 + 4]! > 0) this.lineSeriesIndices.push(s);
+    }
   }
 
   private uploadSeriesAxis(): void {
@@ -514,24 +568,27 @@ export class LineChart {
       this.requestRender();
     };
     sync();
-    new ResizeObserver(sync).observe(this.canvas);
+    this.resizeObserver = new ResizeObserver(sync);
+    this.resizeObserver.observe(this.canvas);
 
     this.canvas.addEventListener('mousedown', (e) => {
       this.dragging   = true;
       this.lastMouseX = e.clientX;
       this.canvas.style.cursor = 'grabbing';
     });
-    window.addEventListener('mouseup', () => {
+    this.onWindowMouseUp = () => {
       if (this.dragging) this.requestAxisExtents();
       this.dragging = false;
       this.canvas.style.cursor = '';
-    });
-    window.addEventListener('mousemove', (e) => {
+    };
+    this.onWindowMouseMove = (e: MouseEvent) => {
       if (!this.dragging) return;
       const dx = e.clientX - this.lastMouseX;
       this.lastMouseX = e.clientX;
       this.panByCssPixels(dx);
-    });
+    };
+    window.addEventListener('mouseup',   this.onWindowMouseUp);
+    window.addEventListener('mousemove', this.onWindowMouseMove);
     this.canvas.addEventListener('wheel', (e) => {
       e.preventDefault();
       const rect   = this.canvas.getBoundingClientRect();
@@ -638,9 +695,7 @@ export class LineChart {
   // Drag: only the X offset changes.
   private writeViewOffset(): void {
     const { offsetX } = this.computeXScaleOffset();
-    const f = this.viewStagingF;
-    f[2] = offsetX;
-    f[3] = 0; // scale.y/offset.y unused (per-axis Y handled in axesBuf)
+    this.viewStagingF[2] = offsetX;
     this.device.queue.writeBuffer(this.viewBuf, 8, this.viewStaging, 8, 8);
   }
 
@@ -702,23 +757,28 @@ export class LineChart {
       const results = arr.slice(); // copy before unmap
       this.extentReadbackBuf.unmap();
       this.extentInFlight = false;
+      let anyChanged = false;
       for (let a = 0; a < this.series.axisCount; a++) {
-        this.applyAxisAutoscale(a, results[a * 2]!, results[a * 2 + 1]!);
+        if (this.applyAxisAutoscale(a, results[a * 2]!, results[a * 2 + 1]!)) anyChanged = true;
+      }
+      if (anyChanged) {
+        this.uploadAxes();
+        this.updateLabels();
+        this.requestRender();
       }
       if (this.extentDirty) this.requestAxisExtents();
-    }).catch(() => {
+    }).catch((err: unknown) => {
+      console.error('[extent] readback failed:', err);
       this.extentInFlight = false;
     });
   }
 
-  private applyAxisAutoscale(a: number, yMin: number, yMax: number): void {
-    if (!isFinite(yMin) || !isFinite(yMax) || yMax <= yMin) return;
+  private applyAxisAutoscale(a: number, yMin: number, yMax: number): boolean {
+    if (!isFinite(yMin) || !isFinite(yMax) || yMax <= yMin) return false;
     const pad = (yMax - yMin) * 0.05 || 0.5;
     this.axisMinY[a] = yMin - pad;
     this.axisMaxY[a] = yMax + pad;
-    this.uploadAxes();
-    this.updateLabels();
-    this.requestRender();
+    return true;
   }
 
   // ---- label overlay -------------------------------------------------------
@@ -739,8 +799,8 @@ export class LineChart {
 
     const emitChar = (c: string, curX: number, topY: number, color: readonly [number, number, number, number]): number => {
       if (count >= TEXT_MAX_CHARS) return 0;
-      const idx = TEXT_CHARS.indexOf(c);
-      if (idx < 0) return 0;
+      const idx = this.charIndex.get(c);
+      if (idx === undefined) return 0;
       const m    = this.charMeta[idx]!;
       const ndcX =  (curX / w) * 2 - 1;
       const ndcY = 1 - (topY / h) * 2;
@@ -760,8 +820,8 @@ export class LineChart {
     const emitLabel = (text: string, anchorX: number, anchorY: number, centerX: boolean, color: readonly [number, number, number, number]) => {
       let totalW = 0;
       for (const c of text) {
-        const idx = TEXT_CHARS.indexOf(c);
-        if (idx >= 0) totalW += this.charMeta[idx]!.width;
+        const idx = this.charIndex.get(c);
+        if (idx !== undefined) totalW += this.charMeta[idx]!.width;
       }
       let curX = centerX ? anchorX - totalW / 2 : anchorX;
       const topY = anchorY - this.atlasH / 2;
@@ -804,8 +864,8 @@ export class LineChart {
       }
 
       // Colored squares at the top of the column — one per series on this axis.
-      const sqIdx = TEXT_CHARS.indexOf('█');
-      const sqW   = sqIdx >= 0 ? this.charMeta[sqIdx]!.width : 8;
+      const sqIdx = this.charIndex.get('█');
+      const sqW   = sqIdx !== undefined ? this.charMeta[sqIdx]!.width : 8;
       const colCenterX = colLeft + PX_PER_AXIS / 2;
       const srcs: number[] = [];
       for (let s = 0; s < this.series.seriesCount; s++) {
@@ -814,9 +874,9 @@ export class LineChart {
       let sqX = colCenterX - (srcs.length * sqW) / 2;
       for (const s of srcs) {
         const color = [
-          this.series.meta[s * 8 + 0]!,
-          this.series.meta[s * 8 + 1]!,
-          this.series.meta[s * 8 + 2]!,
+          this.series.meta[s * 12 + 0]!,
+          this.series.meta[s * 12 + 1]!,
+          this.series.meta[s * 12 + 2]!,
           1,
         ] as const;
         emitChar('█', sqX, 4, color);
@@ -831,6 +891,18 @@ export class LineChart {
   }
 
   // ---- visible sample range ------------------------------------------------
+
+  private visiblePoints(): [number, number] {
+    const x = this.series.x;
+    const N = this.series.pointCount;
+    let lo = 0, hi = N;
+    while (lo < hi) { const m = (lo + hi) >>> 1; if (x[m]! < this.dataMinX) lo = m + 1; else hi = m; }
+    const first = Math.max(0, lo - 1);
+    lo = 0; hi = N;
+    while (lo < hi) { const m = (lo + hi) >>> 1; if (x[m]! <= this.dataMaxX) lo = m + 1; else hi = m; }
+    const last = Math.min(N - 1, lo);
+    return [first, last];
+  }
 
   private visibleSamples(): [number, number] {
     const x   = this.series.x;
@@ -877,12 +949,28 @@ export class LineChart {
     pass.setBindGroup(0, this.gridBind);
     pass.draw(3);
 
-    pass.setPipeline(this.linePipeline);
-    pass.setBindGroup(0, this.lineBind);
-    if (this.series.pointCount >= 2) {
+    if (this.lineSeriesIndices.length > 0 && this.series.pointCount >= 2) {
       const [firstS, lastS] = this.visibleSamples();
       const count = lastS - firstS + 1;
-      if (count > 0) pass.draw(2 * count, this.series.seriesCount, 2 * firstS);
+      if (count > 0) {
+        pass.setPipeline(this.linePipeline);
+        pass.setBindGroup(0, this.lineBind);
+        for (const s of this.lineSeriesIndices) {
+          pass.draw(2 * count, 1, 2 * firstS, s);
+        }
+      }
+    }
+
+    if (this.pointSeriesIndices.length > 0) {
+      const [firstPt, lastPt] = this.visiblePoints();
+      const ptCount = lastPt - firstPt + 1;
+      if (ptCount > 0) {
+        pass.setPipeline(this.pointPipeline);
+        pass.setBindGroup(0, this.pointBind);
+        for (const s of this.pointSeriesIndices) {
+          pass.draw(6, ptCount, 0, s * this.series.pointCount + firstPt);
+        }
+      }
     }
 
     if (this.textCharCount > 0) {

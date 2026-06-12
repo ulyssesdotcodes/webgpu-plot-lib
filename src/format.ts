@@ -25,33 +25,42 @@
 //   14-15  reserved
 //
 // Y matrix is series-major: y[s, i] lives at yOffset + (s*pointCount + i) * 4.
-// Meta is an array of vec4+vec4 (32B per series):
-//   floats 0-3: color RGBA
+// Meta is an array of 48B per series (3 × vec4):
+//   floats 0-3: line color RGBA
 //   float  4:   lineWidth (px)
 //   float  5:   axisIndex (effectively u32)
-//   floats 6-7: padding
+//   float  6:   pointSize (px); 0 = no points
+//   float  7:   pointShape (0=none, 1=circle, 2=triangle, 3=square)
+//   floats 8-11: point color RGBA
 // Axes is an array of 32B per axis:
 //   floats 0-3: label tint color RGBA
-//   float  4:   side  (0 = left; 1 = first right; 2 = second right; …)
-//   floats 5-7: padding
+//   floats 4-7: padding
 
 export const MAGIC       = 0x32564456; // 'VDV2' little-endian
 export const VERSION     = 2;
 export const HEADER_BYTES = 64;
-export const META_STRIDE  = 32; // bytes per series
+export const META_STRIDE  = 48; // bytes per series (12 floats)
 export const AXIS_STRIDE  = 32; // bytes per axis
 
 export const FLAG_SHARED_X = 1 << 0;
+
+export type PointShape = 'circle' | 'triangle' | 'square';
+
+export interface PointStyle {
+  size?:  number;
+  shape?: PointShape;
+  color?: [number, number, number, number];
+}
 
 export interface SeriesStyle {
   color:      [number, number, number, number];
   width:      number;
   axisIndex?: number;
+  points?:    PointStyle;
 }
 
 export interface AxisConfig {
-  color:  [number, number, number, number];
-  side?:  number; // 0 = left, 1+ = right stack (auto-assigned if omitted)
+  color: [number, number, number, number];
 }
 
 export interface SeriesBufferView {
@@ -98,25 +107,27 @@ export function createSeriesBuffer(groups: number[], pointCount: number): Series
 
   const x    = new Float32Array(buffer, header[5]!,  pointCount);
   const y    = new Float32Array(buffer, header[6]!,  seriesCount * pointCount);
-  const meta = new Float32Array(buffer, header[7]!,  seriesCount * 8);
+  const meta = new Float32Array(buffer, header[7]!,  seriesCount * 12);
   const axes = new Float32Array(buffer, header[13]!, axisCount   * 8);
 
-  // Default series meta: white, 2.5 px, axis assigned from groups.
+  // Default series meta: white, 2.5 px, no points, axis assigned from groups.
   let s = 0;
   for (let a = 0; a < axisCount; a++) {
     for (let g = 0; g < groups[a]!; g++, s++) {
-      const o = s * 8;
-      meta[o] = 1; meta[o+1] = 1; meta[o+2] = 1; meta[o+3] = 1;
-      meta[o+4] = 2.5;
-      meta[o+5] = a; // axisIndex
+      const o = s * 12;
+      meta[o] = 1; meta[o+1] = 1; meta[o+2] = 1; meta[o+3] = 1; // line color: white
+      meta[o+4] = 2.5;  // lineWidth
+      meta[o+5] = a;    // axisIndex
+      meta[o+6] = 0;    // pointSize: 0 = no points
+      meta[o+7] = 0;    // pointShape: none
+      meta[o+8] = 1; meta[o+9] = 1; meta[o+10] = 1; meta[o+11] = 1; // pointColor: white
     }
   }
 
-  // Default axis config: white labels; axis 0 → left, others → right stack.
+  // Default axis config: white labels.
   for (let a = 0; a < axisCount; a++) {
     const o = a * 8;
     axes[o] = 1; axes[o+1] = 1; axes[o+2] = 1; axes[o+3] = 1;
-    axes[o+4] = a === 0 ? 0 : a;
   }
 
   return { buffer, header, headerF, x, y, meta, axes, seriesCount, pointCount, axisCount };
@@ -136,20 +147,31 @@ export function viewSeriesBuffer(buffer: ArrayBuffer): SeriesBufferView {
     buffer, header, headerF,
     x:    new Float32Array(buffer, header[5]!,  pointCount),
     y:    new Float32Array(buffer, header[6]!,  seriesCount * pointCount),
-    meta: new Float32Array(buffer, header[7]!,  seriesCount * 8),
+    meta: new Float32Array(buffer, header[7]!,  seriesCount * 12),
     axes: new Float32Array(buffer, header[13]!, axisCount   * 8),
     seriesCount, pointCount, axisCount,
   };
 }
 
+const POINT_SHAPE_MAP: Record<PointShape, number> = { circle: 1, triangle: 2, square: 3 };
+
 export function setStyle(view: SeriesBufferView, series: number, style: SeriesStyle): void {
-  const o = series * 8;
+  const o = series * 12;
   view.meta[o]   = style.color[0];
   view.meta[o+1] = style.color[1];
   view.meta[o+2] = style.color[2];
   view.meta[o+3] = style.color[3];
   view.meta[o+4] = style.width;
   if (style.axisIndex !== undefined) view.meta[o+5] = style.axisIndex;
+  if (style.points !== undefined) {
+    view.meta[o+6] = style.points.size  ?? 6;
+    view.meta[o+7] = style.points.shape ? POINT_SHAPE_MAP[style.points.shape] : 1;
+    const pc = style.points.color ?? style.color;
+    view.meta[o+8]  = pc[0];
+    view.meta[o+9]  = pc[1];
+    view.meta[o+10] = pc[2];
+    view.meta[o+11] = pc[3];
+  }
 }
 
 export function setAxisConfig(view: SeriesBufferView, axisIndex: number, config: AxisConfig): void {
@@ -158,15 +180,10 @@ export function setAxisConfig(view: SeriesBufferView, axisIndex: number, config:
   view.axes[o+1] = config.color[1];
   view.axes[o+2] = config.color[2];
   view.axes[o+3] = config.color[3];
-  if (config.side !== undefined) view.axes[o+4] = config.side;
 }
 
 export function getSeriesAxis(view: SeriesBufferView, series: number): number {
-  return Math.round(view.meta[series * 8 + 5]!);
-}
-
-export function getAxisSide(view: SeriesBufferView, axisIndex: number): number {
-  return Math.round(view.axes[axisIndex * 8 + 4]!);
+  return Math.round(view.meta[series * 12 + 5]!);
 }
 
 export function getAxisColor(view: SeriesBufferView, axisIndex: number): [number, number, number, number] {

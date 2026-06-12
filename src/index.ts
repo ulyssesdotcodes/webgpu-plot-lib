@@ -20,9 +20,9 @@ async function main(): Promise<void> {
       if (!info) { tooltip.style.display = 'none'; return; }
       const lines = [`<b>x = ${info.x.toFixed(4)}</b>`];
       for (let s = 0; s < info.ys.length; s++) {
-        const r = Math.round(data.meta[s * 8 + 0]! * 255);
-        const g = Math.round(data.meta[s * 8 + 1]! * 255);
-        const b = Math.round(data.meta[s * 8 + 2]! * 255);
+        const r = Math.round(data.meta[s * 12 + 0]! * 255);
+        const g = Math.round(data.meta[s * 12 + 1]! * 255);
+        const b = Math.round(data.meta[s * 12 + 2]! * 255);
         lines.push(`<span style="color:rgb(${r},${g},${b})">■</span> ${info.ys[s]!.toFixed(4)}`);
       }
       tooltip.style.display = 'block';

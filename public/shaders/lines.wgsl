@@ -14,8 +14,9 @@ struct View {
 };
 
 struct SeriesMeta {
-  color:   vec4f,
-  styling: vec4f,  // x = lineWidth px, y = axisIndex (bitcast u32)
+  color:      vec4f,
+  styling:    vec4f,   // x=lineWidth px, y=axisIndex(bitcast u32), z=pointSize px, w=pointShape(0..3)
+  pointColor: vec4f,
 };
 
 // Per-axis Y transform and label color (matches chart.ts axesBuf layout).
@@ -67,7 +68,7 @@ struct VertexOut {
   );
 
   let scaleXY = vec2f(view.scale.x, ax.yScale);
-  let tanPx   = normalize(tanDat * scaleXY * ndcToPx + vec2f(1e-6, 0.0));
+  let tanPx   = normalize(tanDat * scaleXY * ndcToPx + vec2f(1e-6, 1e-6));
   let nrmPx   = vec2f(-tanPx.y, tanPx.x);
 
   let halfW  = m.styling.x * 0.5;
