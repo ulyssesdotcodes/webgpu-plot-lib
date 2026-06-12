@@ -127,6 +127,11 @@ export class LineChart {
   private lastMouseX = 0;
   private lastHoverPoint = -1;
 
+  private rightDragging     = false;
+  private rightStartClientX = 0;
+  private rightEndClientX   = 0;
+  private selectionEl:      HTMLDivElement | null = null;
+
   // CSS-pixel canvas dimensions, kept by ResizeObserver.
   private cssWidth  = 1;
   private cssHeight = 1;
@@ -257,6 +262,7 @@ export class LineChart {
     this.resizeObserver.disconnect();
     window.removeEventListener('mouseup',    this.onWindowMouseUp);
     window.removeEventListener('mousemove',  this.onWindowMouseMove);
+    this.hideSelectionEl();
     this.device.destroy();
   }
 
@@ -554,6 +560,52 @@ export class LineChart {
     this.device.queue.writeBuffer(this.axesBuf, 0, this.axesStagingF);
   }
 
+  private updateSelectionEl(clientX0: number, clientX1: number): void {
+    if (!this.selectionEl) {
+      const el = document.createElement('div');
+      el.style.cssText = 'position:fixed;pointer-events:none;background:rgba(100,160,255,0.15);border:1px solid rgba(100,160,255,0.7);box-sizing:border-box;z-index:9999';
+      document.body.appendChild(el);
+      this.selectionEl = el;
+    }
+    const rect  = this.canvas.getBoundingClientRect();
+    const left  = this.gutterLeft();
+    const plotL = rect.left + left;
+    const plotR = rect.right - this.gutterRight();
+    const x0 = Math.max(plotL, Math.min(plotR, Math.min(clientX0, clientX1)));
+    const x1 = Math.max(plotL, Math.min(plotR, Math.max(clientX0, clientX1)));
+    this.selectionEl.style.left   = `${x0}px`;
+    this.selectionEl.style.top    = `${rect.top}px`;
+    this.selectionEl.style.width  = `${x1 - x0}px`;
+    this.selectionEl.style.height = `${rect.height}px`;
+    this.selectionEl.style.display = x1 - x0 > 0 ? 'block' : 'none';
+  }
+
+  private hideSelectionEl(): void {
+    if (this.selectionEl) {
+      this.selectionEl.remove();
+      this.selectionEl = null;
+    }
+  }
+
+  private zoomToSelectionRange(clientX0: number, clientX1: number): void {
+    const rect   = this.canvas.getBoundingClientRect();
+    const leftPx = this.gutterLeft();
+    const plotW  = Math.max(1, this.cssWidth - leftPx - this.gutterRight());
+    const toData = (cx: number) => {
+      const fx = Math.max(0, Math.min(1, (cx - rect.left - leftPx) / plotW));
+      return this.dataMinX + fx * (this.dataMaxX - this.dataMinX);
+    };
+    const newMin = toData(Math.min(clientX0, clientX1));
+    const newMax = toData(Math.max(clientX0, clientX1));
+    if (newMax - newMin < 1e-10) return;
+    this.dataMinX = newMin;
+    this.dataMaxX = newMax;
+    this.writeViewScaleOffsetStep();
+    this.updateLabels();
+    this.requestAxisExtents();
+    this.requestRender();
+  }
+
   private attachEvents(): void {
     const sync = () => {
       this.cssWidth  = this.canvas.clientWidth  || 1;
@@ -571,21 +623,43 @@ export class LineChart {
     this.resizeObserver = new ResizeObserver(sync);
     this.resizeObserver.observe(this.canvas);
 
+    this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
     this.canvas.addEventListener('mousedown', (e) => {
-      this.dragging   = true;
-      this.lastMouseX = e.clientX;
-      this.canvas.style.cursor = 'grabbing';
+      if (e.button === 0) {
+        this.dragging   = true;
+        this.lastMouseX = e.clientX;
+        this.canvas.style.cursor = 'grabbing';
+      } else if (e.button === 2) {
+        e.preventDefault();
+        this.rightDragging     = true;
+        this.rightStartClientX = e.clientX;
+        this.rightEndClientX   = e.clientX;
+        this.canvas.style.cursor = 'crosshair';
+        this.updateSelectionEl(e.clientX, e.clientX);
+      }
     });
     this.onWindowMouseUp = () => {
       if (this.dragging) this.requestAxisExtents();
       this.dragging = false;
+      if (this.rightDragging) {
+        this.rightDragging = false;
+        this.hideSelectionEl();
+        this.canvas.style.cursor = '';
+        const x0 = this.rightStartClientX;
+        const x1 = this.rightEndClientX;
+        if (Math.abs(x1 - x0) > 4) this.zoomToSelectionRange(x0, x1);
+      }
       this.canvas.style.cursor = '';
     };
     this.onWindowMouseMove = (e: MouseEvent) => {
-      if (!this.dragging) return;
-      const dx = e.clientX - this.lastMouseX;
-      this.lastMouseX = e.clientX;
-      this.panByCssPixels(dx);
+      if (this.dragging) {
+        const dx = e.clientX - this.lastMouseX;
+        this.lastMouseX = e.clientX;
+        this.panByCssPixels(dx);
+      } else if (this.rightDragging) {
+        this.rightEndClientX = e.clientX;
+        this.updateSelectionEl(this.rightStartClientX, e.clientX);
+      }
     };
     window.addEventListener('mouseup',   this.onWindowMouseUp);
     window.addEventListener('mousemove', this.onWindowMouseMove);
@@ -598,7 +672,7 @@ export class LineChart {
     this.canvas.addEventListener('dblclick', () => this.resetView());
 
     this.canvas.addEventListener('mousemove', (e) => {
-      if (this.dragging) return;
+      if (this.dragging || this.rightDragging) return;
       const rect = this.canvas.getBoundingClientRect();
       this.pickX(e.clientX - rect.left);
     });
