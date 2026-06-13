@@ -146,3 +146,94 @@ pub fn build_labels(
 
     (inst, count)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format;
+
+    fn mock_meta() -> Vec<CharMeta> {
+        TEXT_CHARS.chars().map(|_| CharMeta { u_min: 0.0, u_max: 1.0, width: 8.0 }).collect()
+    }
+
+    fn make_buf(groups: &[u32], point_count: u32) -> Vec<u8> {
+        let mut buf = format::create_series_buffer(groups, point_count);
+        let pc = point_count as usize;
+        let x_off = format::hdr_u32(&buf)[5] as usize;
+        {
+            let xs: &mut [f32] = bytemuck::cast_slice_mut(&mut buf[x_off..x_off + pc * 4]);
+            for i in 0..pc { xs[i] = i as f32 / (pc - 1).max(1) as f32; }
+        }
+        let sc = format::series_count(&buf);
+        let y_off = format::hdr_u32(&buf)[6] as usize;
+        {
+            let ys: &mut [f32] = bytemuck::cast_slice_mut(&mut buf[y_off..y_off + sc * pc * 4]);
+            for (i, v) in ys.iter_mut().enumerate() { *v = i as f32; }
+        }
+        format::recompute_extents(&mut buf);
+        buf
+    }
+
+    #[test]
+    fn x_ticks_emit_chars() {
+        let buf = make_buf(&[1], 4);
+        let meta = mock_meta();
+        let (_, count) = build_labels(&buf, &meta, 12.0, 800.0, 400.0,
+            0.0, 1.0, 0.1, &[0.0], &[1.0]);
+        assert!(count > 0, "expected x-tick chars");
+    }
+
+    #[test]
+    fn y_ticks_emit_chars() {
+        let buf = make_buf(&[1], 4);
+        let meta = mock_meta();
+        // step_x=0 disables x ticks; y range 0..100 should produce y ticks
+        let (_, count) = build_labels(&buf, &meta, 12.0, 800.0, 400.0,
+            0.0, 1.0, 0.0, &[0.0], &[100.0]);
+        assert!(count > 0, "expected y-tick chars");
+    }
+
+    #[test]
+    fn zero_y_range_no_y_ticks() {
+        let buf = make_buf(&[1], 4);
+        let meta = mock_meta();
+        let (_, count) = build_labels(&buf, &meta, 12.0, 800.0, 400.0,
+            0.0, 1.0, 0.0, &[5.0], &[5.0]);  // y_min == y_max
+        assert_eq!(count, 0, "degenerate y range should produce no labels");
+    }
+
+    #[test]
+    fn extra_series_emits_extra_color_block() {
+        let meta = mock_meta();
+        // 1-series axis vs 2-series axis — only difference is one extra █ char
+        let buf1 = make_buf(&[1], 4);
+        let (_, c1) = build_labels(&buf1, &meta, 12.0, 800.0, 400.0,
+            0.0, 1.0, 0.0, &[0.0], &[10.0]);
+
+        let buf2 = make_buf(&[2], 4);
+        let (_, c2) = build_labels(&buf2, &meta, 12.0, 800.0, 400.0,
+            0.0, 1.0, 0.0, &[0.0], &[10.0]);
+
+        assert!(c2 > c1, "2-series should produce more chars than 1-series");
+    }
+
+    #[test]
+    fn count_never_exceeds_max() {
+        let buf = make_buf(&[1], 4);
+        let meta = mock_meta();
+        // tiny step_x → many x ticks
+        let (_, count) = build_labels(&buf, &meta, 12.0, 800.0, 400.0,
+            0.0, 1.0, 0.0001, &[0.0], &[1000.0]);
+        assert!(count <= TEXT_MAX_CHARS);
+    }
+
+    #[test]
+    fn instance_buffer_size_matches_count() {
+        let buf = make_buf(&[1], 4);
+        let meta = mock_meta();
+        let (inst, count) = build_labels(&buf, &meta, 12.0, 800.0, 400.0,
+            0.0, 1.0, 0.1, &[0.0], &[1.0]);
+        assert_eq!(inst.len(), TEXT_MAX_CHARS * TEXT_INST_FLOATS);
+        assert!(count * TEXT_INST_FLOATS <= inst.len());
+    }
+}

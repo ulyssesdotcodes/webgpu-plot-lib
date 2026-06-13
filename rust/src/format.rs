@@ -264,4 +264,71 @@ mod tests {
         assert_eq!(exts[0], (1.0, 4.0));
         assert_eq!(exts[1], (-10.0, 5.0));
     }
+
+    #[test]
+    fn buffer_size_matches_calculation() {
+        let groups = [3u32, 2, 2];
+        let pc = 64usize;
+        let sc = 7usize;
+        let ac = 3usize;
+        let expected = HEADER_BYTES + pc * 4 + sc * pc * 4 + sc * META_STRIDE + ac * AXIS_STRIDE;
+        let buf = create_series_buffer(&groups, pc as u32);
+        assert_eq!(buf.len(), expected);
+    }
+
+    #[test]
+    fn x_slice_write_read() {
+        let mut buf = create_series_buffer(&[1], 4);
+        let x_off = hdr_u32(&buf)[5] as usize;
+        {
+            let xs: &mut [f32] = bytemuck::cast_slice_mut(&mut buf[x_off..x_off + 16]);
+            xs.copy_from_slice(&[0.0, 0.5, 0.75, 1.0]);
+        }
+        let xs = x_slice(&buf);
+        assert_eq!(xs, &[0.0f32, 0.5, 0.75, 1.0]);
+    }
+
+    #[test]
+    fn y_slice_write_read() {
+        let mut buf = create_series_buffer(&[2], 3); // 2 series, 3 points
+        let y_off = hdr_u32(&buf)[6] as usize;
+        {
+            let ys: &mut [f32] = bytemuck::cast_slice_mut(&mut buf[y_off..y_off + 24]);
+            // series 0: 1,2,3 · series 1: 4,5,6
+            ys.copy_from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        }
+        let ys = y_slice(&buf);
+        assert_eq!(ys[0..3], [1.0f32, 2.0, 3.0]);
+        assert_eq!(ys[3..6], [4.0f32, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn get_axis_color_default() {
+        let buf = create_series_buffer(&[2, 1], 4);
+        assert_eq!(get_axis_color(&buf, 0), [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(get_axis_color(&buf, 1), [1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn multi_series_same_axis_cpu_extents() {
+        // 3 series all on axis 0
+        let mut buf = create_series_buffer(&[3], 2);
+        let y_off = hdr_u32(&buf)[6] as usize;
+        {
+            let ys: &mut [f32] = bytemuck::cast_slice_mut(&mut buf[y_off..y_off + 24]);
+            ys.copy_from_slice(&[10.0, 20.0, -5.0, 30.0, 7.0, 3.0]);
+        }
+        let exts = get_axis_cpu_extents(&buf);
+        assert_eq!(exts.len(), 1);
+        assert_eq!(exts[0].0, -5.0);
+        assert_eq!(exts[0].1, 30.0);
+    }
+
+    #[test]
+    fn accessors_return_correct_counts() {
+        let buf = create_series_buffer(&[2, 3], 16);
+        assert_eq!(series_count(&buf), 5);
+        assert_eq!(point_count(&buf), 16);
+        assert_eq!(axis_count(&buf), 2);
+    }
 }

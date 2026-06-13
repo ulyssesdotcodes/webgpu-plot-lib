@@ -110,4 +110,98 @@ mod tests {
         assert_eq!(pick_x(&x, 1.4), 1);
         assert_eq!(pick_x(&x, 1.6), 2);
     }
+
+    #[test]
+    fn pick_x_empty() {
+        assert_eq!(pick_x(&[], 0.5), 0);
+    }
+
+    #[test]
+    fn pick_x_clamps_to_boundary() {
+        let x = vec![0.0f32, 1.0, 2.0];
+        assert_eq!(pick_x(&x, -5.0), 0);
+        assert_eq!(pick_x(&x, 99.0), 2);
+    }
+
+    #[test]
+    fn format_tick_no_decimals() {
+        assert_eq!(format_tick(3.0, 1.0), "3");
+        assert_eq!(format_tick(10.0, 10.0), "10");
+    }
+
+    #[test]
+    fn format_tick_one_decimal() {
+        assert_eq!(format_tick(0.1, 0.1), "0.1");
+        assert_eq!(format_tick(1.5, 0.5), "1.5");
+    }
+
+    #[test]
+    fn format_tick_two_decimals() {
+        assert_eq!(format_tick(0.01, 0.01), "0.01");
+    }
+
+    #[test]
+    fn compute_x_scale_offset_no_gutter() {
+        // data 0..1, width 100 — x=0 → NDC -1, x=1 → NDC +1
+        let (scale, offset) = compute_x_scale_offset(0.0, 1.0, 100.0, 0.0, 0.0);
+        let ndc0 = (0.0f32 - offset) * scale;
+        let ndc1 = (1.0f32 - offset) * scale;
+        assert!((ndc0 - (-1.0)).abs() < 1e-5, "ndc0={ndc0}");
+        assert!((ndc1 - 1.0).abs() < 1e-5, "ndc1={ndc1}");
+    }
+
+    #[test]
+    fn compute_x_scale_offset_with_gutter() {
+        // data 0..1, width 100, gutter_left 20
+        // x=0 → CSS 20 → NDC 2*20/100-1 = -0.6
+        // x=1 → CSS 100 → NDC 1.0
+        let (scale, offset) = compute_x_scale_offset(0.0, 1.0, 100.0, 20.0, 0.0);
+        let ndc0 = (0.0f32 - offset) * scale;
+        let ndc1 = (1.0f32 - offset) * scale;
+        assert!((ndc0 - (-0.6)).abs() < 1e-5, "ndc0={ndc0}");
+        assert!((ndc1 - 1.0).abs() < 1e-5, "ndc1={ndc1}");
+    }
+
+    #[test]
+    fn visible_points_all_in_range() {
+        let x = vec![0.0f32, 1.0, 2.0, 3.0, 4.0];
+        let (first, last) = visible_points(&x, -1.0, 10.0);
+        assert_eq!(first, 0);
+        assert_eq!(last, 4);
+    }
+
+    #[test]
+    fn visible_points_none_in_range() {
+        let x = vec![0.0f32, 1.0, 2.0];
+        let (first, last) = visible_points(&x, 10.0, 20.0);
+        assert!(first >= last || first == x.len());
+    }
+
+    #[test]
+    fn visible_samples_range() {
+        let x = vec![0.0f32, 1.0, 2.0, 3.0, 4.0];
+        // first_pt=2 (first ≥ 1.5), last_pt=2 (last ≤ 2.5)
+        // first = (2*4).saturating_sub(4) = 4
+        // last  = (2*4+4).min(16) = 12
+        let (first, last) = visible_samples(&x, 1.5, 2.5, 4);
+        assert_eq!(first, 4);
+        assert_eq!(last, 12);
+    }
+
+    #[test]
+    fn visible_samples_short_input() {
+        assert_eq!(visible_samples(&[], 0.0, 1.0, 4), (0, 0));
+        assert_eq!(visible_samples(&[0.5], 0.0, 1.0, 4), (0, 0));
+    }
+
+    #[test]
+    fn nice_step_zero_range_returns_one() {
+        assert_eq!(nice_step(0.0, 800.0, 100.0), 1.0);
+    }
+
+    #[test]
+    fn nice_step_large_range() {
+        // range=1000 → raw=125 → nice=100
+        assert!((nice_step(1000.0, 800.0, 100.0) - 100.0).abs() < 1e-2);
+    }
 }
