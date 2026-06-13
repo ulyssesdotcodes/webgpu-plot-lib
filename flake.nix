@@ -1,5 +1,5 @@
 {
-  description = "typescript build";
+  description = "typescript + rust/wgpu webgpu chart";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -14,6 +14,8 @@
           default = mkShell {
           buildInputs = with pkgs; [
             nodejs
+            rustup
+            wasm-pack
           ];
 
           npmDeps = importNpmLock.buildNodeModules {
@@ -22,6 +24,7 @@
           };
 
           shellHook = ''
+            rustup target add wasm32-unknown-unknown
             npx tsc --watch &
             npx http-server  -c-1 public
           '';
