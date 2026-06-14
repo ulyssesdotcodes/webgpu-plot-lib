@@ -796,6 +796,8 @@ function __wbg_get_imports() {
             return ret;
         }, arguments); },
         __wbg_requestDevice_6130c3ba10d633f9: function(arg0, arg1) {
+            // Chrome removed maxInterStageShaderComponents; wgpu 22 still sends it.
+            if (arg1?.requiredLimits) delete arg1.requiredLimits.maxInterStageShaderComponents;
             const ret = arg0.requestDevice(arg1);
             return ret;
         },

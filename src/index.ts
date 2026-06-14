@@ -193,7 +193,9 @@ async function runRust(
   pointCount: number,
 ): Promise<void> {
   // Dynamic import so the wasm module is only loaded in rust mode.
-  const wasmMod = await import('../public/pkg/webgpu_plot_lib.js') as {
+  // Path is relative to the compiled output (public/), not the source (src/).
+  // @ts-ignore
+  const wasmMod = await import('./pkg/webgpu_plot_lib.js') as unknown as {
     default: () => Promise<void>;
     Chart: {
       create(

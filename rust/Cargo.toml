@@ -14,12 +14,12 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.wgpu]
-version = "22"
+version = "23"
 default-features = false
 features = ["wgsl", "webgpu"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.wgpu]
-version = "22"
+version = "23"
 features = ["wgsl"]
 
 [dependencies.web-sys]
