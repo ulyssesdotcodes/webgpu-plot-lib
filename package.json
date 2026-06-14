@@ -5,9 +5,10 @@
   "main": "src/index.ts",
   "scripts": {
     "build:ts": "tsc",
-    "build:wasm": "wasm-pack build rust/ --target web --out-dir ../public/pkg",
-    "build": "npm run build:ts && npm run build:wasm",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build:rust": "wasm-pack build rust/ --target web --out-dir ../public/pkg",
+    "build": "npm run build:ts && npm run build:rust",
+    "test:rust": "cargo test --manifest-path rust/Cargo.toml",
+    "test": "npm run test:rust"
   },
   "keywords": [],
   "author": "",

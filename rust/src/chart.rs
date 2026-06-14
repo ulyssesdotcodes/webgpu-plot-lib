@@ -532,7 +532,6 @@ impl ChartInner {
         self.write_view_all(w, h);
         self.view_initialized = true;
         self.update_labels();
-        self.request_axis_extents_inner();
     }
 
     pub fn resize(&mut self, css_w: f32, css_h: f32, dpr: f32) {
@@ -566,7 +565,6 @@ impl ChartInner {
         self.data_max_x = ax + (self.data_max_x - ax) / factor;
         self.write_view_scale_offset_step();
         self.update_labels();
-        self.request_axis_extents_inner();
     }
 
     pub fn zoom_to_range(&mut self, x0: f32, x1: f32) {
@@ -575,7 +573,6 @@ impl ChartInner {
         self.data_max_x = x0.max(x1);
         self.write_view_scale_offset_step();
         self.update_labels();
-        self.request_axis_extents_inner();
     }
 
     pub fn pick_x_point(&self, css_x: f32) -> i32 {
