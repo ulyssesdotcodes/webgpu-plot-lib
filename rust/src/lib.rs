@@ -88,9 +88,9 @@ impl Chart {
             let mut inner = self.inner.borrow_mut();
             inner.upload_data();
             inner.bake_spline();
+            inner.reset_view();
+            inner.update_axis_extents_cpu();
         }
-        self.inner.borrow_mut().reset_view();
-        ChartInner::request_axis_extents(Rc::clone(&self.inner));
         ChartInner::request_render(&self.inner);
     }
 
@@ -102,8 +102,8 @@ impl Chart {
             inner.upload_data();
             inner.bake_spline();
             inner.reset_view();
+            inner.update_axis_extents_cpu();
         }
-        ChartInner::request_axis_extents(Rc::clone(&self.inner));
         ChartInner::request_render(&self.inner);
     }
 
@@ -118,8 +118,11 @@ impl Chart {
     }
 
     pub fn zoom_at(&self, css_x: f32, factor: f32) {
-        self.inner.borrow_mut().zoom_at(css_x, factor);
-        ChartInner::request_axis_extents(Rc::clone(&self.inner));
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.zoom_at(css_x, factor);
+            inner.update_axis_extents_cpu();
+        }
         ChartInner::request_render(&self.inner);
     }
 
@@ -136,8 +139,11 @@ impl Chart {
             };
             (to_data(css_x0), to_data(css_x1))
         };
-        self.inner.borrow_mut().zoom_to_range(x0, x1);
-        ChartInner::request_axis_extents(Rc::clone(&self.inner));
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.zoom_to_range(x0, x1);
+            inner.update_axis_extents_cpu();
+        }
         ChartInner::request_render(&self.inner);
     }
 

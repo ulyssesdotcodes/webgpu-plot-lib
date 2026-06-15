@@ -170,7 +170,7 @@ pub fn get_extents(buf: &[u8]) -> (f32, f32, f32, f32) {
     (h[8], h[9], h[10], h[11])
 }
 
-/// CPU per-axis Y extents (used for initial view before GPU readback).
+/// Per-axis Y extents over all X (used for the initial full-data view).
 pub fn get_axis_cpu_extents(buf: &[u8]) -> Vec<(f32, f32)> {
     let sc = series_count(buf);
     let pc = point_count(buf);
@@ -184,6 +184,30 @@ pub fn get_axis_cpu_extents(buf: &[u8]) -> Vec<(f32, f32)> {
             let v = y[base + i];
             if v < out[a].0 { out[a].0 = v; }
             if v > out[a].1 { out[a].1 = v; }
+        }
+    }
+    out
+}
+
+/// Per-axis Y extents restricted to the visible X window [x_min, x_max].
+/// Used for autoscale after pan/zoom without requiring GPU readback.
+pub fn compute_visible_axis_extents(buf: &[u8], x_min: f32, x_max: f32) -> Vec<(f32, f32)> {
+    let sc = series_count(buf);
+    let pc = point_count(buf);
+    let ac = axis_count(buf);
+    let x = x_slice(buf);
+    let y = y_slice(buf);
+    let mut out = vec![(f32::INFINITY, f32::NEG_INFINITY); ac];
+    for s in 0..sc {
+        let a = get_series_axis(buf, s);
+        let base = s * pc;
+        for i in 0..pc {
+            let xv = x[i];
+            if xv >= x_min && xv <= x_max {
+                let yv = y[base + i];
+                if yv < out[a].0 { out[a].0 = yv; }
+                if yv > out[a].1 { out[a].1 = yv; }
+            }
         }
     }
     out
@@ -322,6 +346,83 @@ mod tests {
         assert_eq!(exts.len(), 1);
         assert_eq!(exts[0].0, -5.0);
         assert_eq!(exts[0].1, 30.0);
+    }
+
+    #[test]
+    fn visible_axis_extents_full_range() {
+        // Full X range should match get_axis_cpu_extents
+        let mut buf = create_series_buffer(&[1, 1], 4);
+        let x_off = hdr_u32(&buf)[5] as usize;
+        let y_off = hdr_u32(&buf)[6] as usize;
+        {
+            let xs: &mut [f32] = bytemuck::cast_slice_mut(&mut buf[x_off..x_off + 16]);
+            xs.copy_from_slice(&[0.0, 1.0, 2.0, 3.0]);
+        }
+        {
+            let ys: &mut [f32] = bytemuck::cast_slice_mut(&mut buf[y_off..y_off + 32]);
+            ys[0] = 5.0; ys[1] = -3.0; ys[2] = 8.0; ys[3] = 1.0;  // axis 0
+            ys[4] = 100.0; ys[5] = 50.0; ys[6] = 75.0; ys[7] = 90.0; // axis 1
+        }
+        let full = compute_visible_axis_extents(&buf, 0.0, 3.0);
+        let cpu  = get_axis_cpu_extents(&buf);
+        assert_eq!(full[0], cpu[0]);
+        assert_eq!(full[1], cpu[1]);
+    }
+
+    #[test]
+    fn visible_axis_extents_restricted_range() {
+        let mut buf = create_series_buffer(&[1], 4);
+        let x_off = hdr_u32(&buf)[5] as usize;
+        let y_off = hdr_u32(&buf)[6] as usize;
+        {
+            let xs: &mut [f32] = bytemuck::cast_slice_mut(&mut buf[x_off..x_off + 16]);
+            xs.copy_from_slice(&[0.0, 1.0, 2.0, 3.0]);
+        }
+        {
+            let ys: &mut [f32] = bytemuck::cast_slice_mut(&mut buf[y_off..y_off + 16]);
+            // Only x∈[1,2] is visible; y values there are -3 and 8
+            ys.copy_from_slice(&[99.0, -3.0, 8.0, 99.0]);
+        }
+        let ext = compute_visible_axis_extents(&buf, 1.0, 2.0);
+        assert_eq!(ext[0].0, -3.0);
+        assert_eq!(ext[0].1, 8.0);
+    }
+
+    #[test]
+    fn visible_axis_extents_no_visible_points() {
+        let mut buf = create_series_buffer(&[1], 4);
+        let x_off = hdr_u32(&buf)[5] as usize;
+        {
+            let xs: &mut [f32] = bytemuck::cast_slice_mut(&mut buf[x_off..x_off + 16]);
+            xs.copy_from_slice(&[0.0, 1.0, 2.0, 3.0]);
+        }
+        let ext = compute_visible_axis_extents(&buf, 10.0, 20.0);
+        // No points in range: extents stay at INF/-INF (sentinel for "no data")
+        assert!(ext[0].0.is_infinite() && ext[0].0 > 0.0);
+        assert!(ext[0].1.is_infinite() && ext[0].1 < 0.0);
+    }
+
+    #[test]
+    fn visible_axis_extents_multi_axis() {
+        let mut buf = create_series_buffer(&[2, 1], 3);
+        let x_off = hdr_u32(&buf)[5] as usize;
+        let y_off = hdr_u32(&buf)[6] as usize;
+        {
+            let xs: &mut [f32] = bytemuck::cast_slice_mut(&mut buf[x_off..x_off + 12]);
+            xs.copy_from_slice(&[0.0, 1.0, 2.0]);
+        }
+        {
+            let ys: &mut [f32] = bytemuck::cast_slice_mut(&mut buf[y_off..y_off + 36]);
+            // series 0 (axis 0): 1, 2, 3
+            ys[0] = 1.0; ys[1] = 2.0; ys[2] = 3.0;
+            // series 1 (axis 0): 4, 5, 6
+            ys[3] = 4.0; ys[4] = 5.0; ys[5] = 6.0;
+            // series 2 (axis 1): -10, -20, -30
+            ys[6] = -10.0; ys[7] = -20.0; ys[8] = -30.0;
+        }
+        let ext = compute_visible_axis_extents(&buf, 0.5, 1.5); // only x=1 visible
+        assert_eq!(ext[0], (2.0, 5.0)); // min(2,5)=2, max(2,5)=5
+        assert_eq!(ext[1], (-20.0, -20.0));
     }
 
     #[test]

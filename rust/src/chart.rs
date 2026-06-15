@@ -16,7 +16,6 @@ use crate::view::{compute_x_scale_offset, nice_step, visible_points, visible_sam
 const VIEW_BYTES: u64        = 40;
 const STYLE_BYTES: u64       = 32;
 const SPLINE_PARAMS_BYTES: u64 = 16;
-const EXTENT_PARAMS_BYTES: u64 = 16;
 const AXIS_GPU_BYTES: u64    = 32; // 8 f32 per axis
 const SUBDIVS: u32           = 4;
 const PX_PER_AXIS: f32       = 55.0;
@@ -27,7 +26,6 @@ const SHADER_LINES:  &str = include_str!("../../public/shaders/lines.wgsl");
 const SHADER_POINTS: &str = include_str!("../../public/shaders/points.wgsl");
 const SHADER_TEXT:   &str = include_str!("../../public/shaders/text.wgsl");
 const SHADER_SPLINE: &str = include_str!("../../public/shaders/spline.wgsl");
-const SHADER_EXTENT: &str = include_str!("../../public/shaders/extent.wgsl");
 
 pub struct ChartInner {
     // GPU core
@@ -46,23 +44,18 @@ pub struct ChartInner {
     pub axis_count:     usize,
 
     // GPU buffers
-    pub view_buf:            wgpu::Buffer,
-    pub style_buf:           wgpu::Buffer,
-    pub x_buf:               wgpu::Buffer,
-    pub y_buf:               wgpu::Buffer,
-    pub meta_buf:            wgpu::Buffer,
-    pub axes_buf:            wgpu::Buffer,
-    pub series_axis_buf:     wgpu::Buffer,
-    pub spline_params_buf:   wgpu::Buffer,
-    pub spline_buf:          wgpu::Buffer,
-    pub extent_params_buf:   wgpu::Buffer,
-    pub extent_result_buf:   wgpu::Buffer,
-    pub extent_readback_buf: Rc<wgpu::Buffer>,
-    pub text_inst_buf:       wgpu::Buffer,
+    pub view_buf:          wgpu::Buffer,
+    pub style_buf:         wgpu::Buffer,
+    pub x_buf:             wgpu::Buffer,
+    pub y_buf:             wgpu::Buffer,
+    pub meta_buf:          wgpu::Buffer,
+    pub axes_buf:          wgpu::Buffer,
+    pub spline_params_buf: wgpu::Buffer,
+    pub spline_buf:        wgpu::Buffer,
+    pub text_inst_buf:     wgpu::Buffer,
 
     // Pipelines
     pub spline_pipeline: wgpu::ComputePipeline,
-    pub extent_pipeline: wgpu::ComputePipeline,
     pub grid_pipeline:   wgpu::RenderPipeline,
     pub line_pipeline:   wgpu::RenderPipeline,
     pub point_pipeline:  wgpu::RenderPipeline,
@@ -70,7 +63,6 @@ pub struct ChartInner {
 
     // Bind groups
     pub spline_bind: wgpu::BindGroup,
-    pub extent_bind: wgpu::BindGroup,
     pub grid_bind:   wgpu::BindGroup,
     pub line_bind:   wgpu::BindGroup,
     pub point_bind:  wgpu::BindGroup,
@@ -94,9 +86,6 @@ pub struct ChartInner {
     // Staging for view uniform (10 × f32 / u32, reinterpreted)
     pub view_staging: [u8; VIEW_BYTES as usize],
 
-    // Staging for extent params
-    pub extent_params_staging: [u8; EXTENT_PARAMS_BYTES as usize],
-
     // Per-axis GPU staging (8 f32 per axis)
     pub axes_staging: Vec<f32>,
 
@@ -105,11 +94,9 @@ pub struct ChartInner {
     pub point_series: Vec<usize>,
 
     // State flags
-    pub view_initialized:  bool,
-    pub text_char_count:   u32,
-    pub extent_in_flight:  bool,
-    pub extent_dirty:      bool,
-    pub render_queued:     bool,
+    pub view_initialized: bool,
+    pub text_char_count:  u32,
+    pub render_queued:    bool,
 
     // Options
     pub background: [f32; 4],
@@ -184,7 +171,6 @@ impl ChartInner {
         let pc = point_count as usize;
 
         let total_samples = SUBDIVS as usize * (pc - 1) + 1;
-        let extent_result_bytes = (axis_count * 8) as u64;
 
         // Build GPU buffers.
         let view_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -211,10 +197,6 @@ impl ChartInner {
             label: Some("axes"), size: (axis_count as u64) * AXIS_GPU_BYTES,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
         });
-        let series_axis_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("series-axis"), size: (series_count * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
-        });
         let spline_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("spline-params"), size: SPLINE_PARAMS_BYTES,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
@@ -223,18 +205,6 @@ impl ChartInner {
             label: Some("spline"), size: (series_count * total_samples * 8) as u64,
             usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false,
         });
-        let extent_params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("extent-params"), size: EXTENT_PARAMS_BYTES,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
-        });
-        let extent_result_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("extent-result"), size: extent_result_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false,
-        });
-        let extent_readback_buf = Rc::new(device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("extent-readback"), size: extent_result_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
-        }));
         let text_inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("text-inst"), size: (TEXT_MAX_CHARS * TEXT_INST_FLOATS * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
@@ -257,16 +227,10 @@ impl ChartInner {
         let points_mod = mk_shader(SHADER_POINTS, "points");
         let text_mod   = mk_shader(SHADER_TEXT,   "text");
         let spline_mod = mk_shader(SHADER_SPLINE, "spline");
-        let extent_mod = mk_shader(SHADER_EXTENT, "extent");
 
         // Compute pipelines.
         let spline_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("spline"), layout: None, module: &spline_mod,
-            entry_point: "main", compilation_options: Default::default(),
-            cache: None,
-        });
-        let extent_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("extent"), layout: None, module: &extent_mod,
             entry_point: "main", compilation_options: Default::default(),
             cache: None,
         });
@@ -334,17 +298,6 @@ impl ChartInner {
                 wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: y_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: spline_buf.as_entire_binding() },
-            ],
-        });
-        let extent_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("extent-bg"),
-            layout: &extent_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: extent_params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: y_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: extent_result_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: series_axis_buf.as_entire_binding() },
             ],
         });
         let grid_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -429,22 +382,19 @@ impl ChartInner {
             surface, device, queue, surface_fmt, alpha_mode,
             surface_w: canvas_w, surface_h: canvas_h,
             vdv2, series_count, point_count: pc, axis_count,
-            view_buf, style_buf, x_buf, y_buf, meta_buf, axes_buf, series_axis_buf,
-            spline_params_buf, spline_buf, extent_params_buf, extent_result_buf,
-            extent_readback_buf,
+            view_buf, style_buf, x_buf, y_buf, meta_buf, axes_buf,
+            spline_params_buf, spline_buf,
             text_inst_buf, atlas_texture, atlas_sampler, char_meta, atlas_h: atlas_h_px,
-            spline_pipeline, extent_pipeline, grid_pipeline, line_pipeline, point_pipeline, text_pipeline,
-            spline_bind, extent_bind, grid_bind, line_bind, point_bind, text_bind,
+            spline_pipeline, grid_pipeline, line_pipeline, point_pipeline, text_pipeline,
+            spline_bind, grid_bind, line_bind, point_bind, text_bind,
             css_width: css_w, css_height: css_h, pixel_ratio,
             data_min_x: 0.0, data_max_x: 1.0,
             axis_min_y: vec![0.0; axis_count],
             axis_max_y: vec![1.0; axis_count],
             view_staging: [0u8; VIEW_BYTES as usize],
-            extent_params_staging: [0u8; EXTENT_PARAMS_BYTES as usize],
             axes_staging: vec![0.0; axis_count * 8],
             line_series: vec![], point_series: vec![],
-            view_initialized: false, text_char_count: 0,
-            extent_in_flight: false, extent_dirty: false, render_queued: false,
+            view_initialized: false, text_char_count: 0, render_queued: false,
             background, grid_color,
         };
 
@@ -457,16 +407,8 @@ impl ChartInner {
         self.queue.write_buffer(&self.x_buf,    0, format::x_bytes(&self.vdv2));
         self.queue.write_buffer(&self.y_buf,    0, format::y_bytes(&self.vdv2));
         self.queue.write_buffer(&self.meta_buf, 0, format::meta_bytes(&self.vdv2));
-        self.upload_series_axis();
         self.line_series  = (0..self.series_count).filter(|&s| format::meta_slice(&self.vdv2)[s * 12 + 4] > 0.0).collect();
         self.point_series = (0..self.series_count).filter(|&s| format::meta_slice(&self.vdv2)[s * 12 + 7] > 0.0).collect();
-    }
-
-    fn upload_series_axis(&mut self) {
-        let sa: Vec<u32> = (0..self.series_count)
-            .map(|s| format::get_series_axis(&self.vdv2, s) as u32)
-            .collect();
-        self.queue.write_buffer(&self.series_axis_buf, 0, bytemuck::cast_slice(&sa));
     }
 
     pub fn upload_axes(&mut self) {
@@ -650,45 +592,25 @@ impl ChartInner {
         });
     }
 
-    // ---- extent GPU compute + async readback ---------------------------------
+    // ---- autoscale (CPU, visible X window) ----------------------------------
 
-    fn request_axis_extents_inner(&mut self) {
-        if self.extent_in_flight { self.extent_dirty = true; return; }
-        self.extent_in_flight = true;
-        self.extent_dirty = false;
-
-        {
-            let ep: &mut [f32] = bytemuck::cast_slice_mut(&mut self.extent_params_staging);
-            ep[0] = self.data_min_x;
-            ep[1] = self.data_max_x;
+    pub fn update_axis_extents_cpu(&mut self) {
+        let extents = format::compute_visible_axis_extents(
+            &self.vdv2, self.data_min_x, self.data_max_x,
+        );
+        let mut any_changed = false;
+        for a in 0..self.axis_count {
+            let (y_min, y_max) = extents[a];
+            if !y_min.is_finite() || !y_max.is_finite() || y_max <= y_min { continue; }
+            let pad = ((y_max - y_min) * 0.05).max(0.5);
+            self.axis_min_y[a] = y_min - pad;
+            self.axis_max_y[a] = y_max + pad;
+            any_changed = true;
         }
-        {
-            let eu: &mut [u32] = bytemuck::cast_slice_mut(&mut self.extent_params_staging);
-            eu[2] = self.series_count as u32;
-            eu[3] = self.point_count as u32;
+        if any_changed {
+            self.upload_axes();
+            self.update_labels();
         }
-        self.queue.write_buffer(&self.extent_params_buf, 0, &self.extent_params_staging);
-
-        let result_bytes = (self.axis_count * 8) as u64;
-        let mut enc = self.device.create_command_encoder(&Default::default());
-        {
-            let cp_desc = wgpu::ComputePassDescriptor { label: Some("extent"), timestamp_writes: None };
-            let mut cp = enc.begin_compute_pass(&cp_desc);
-            cp.set_pipeline(&self.extent_pipeline);
-            cp.set_bind_group(0, &self.extent_bind, &[]);
-            cp.dispatch_workgroups(self.axis_count as u32, 1, 1);
-        }
-        enc.copy_buffer_to_buffer(&self.extent_result_buf, 0, &*self.extent_readback_buf, 0, result_bytes);
-        self.queue.submit([enc.finish()]);
-        // Readback map_async is initiated by the caller (request_axis_extents).
-    }
-
-    pub fn apply_axis_autoscale(&mut self, a: usize, y_min: f32, y_max: f32) -> bool {
-        if !y_min.is_finite() || !y_max.is_finite() || y_max <= y_min { return false; }
-        let pad = ((y_max - y_min) * 0.05).max(0.5);
-        self.axis_min_y[a] = y_min - pad;
-        self.axis_max_y[a] = y_max + pad;
-        true
     }
 
     // ---- labels --------------------------------------------------------------
@@ -821,54 +743,4 @@ impl ChartInner {
         closure.forget();
     }
 
-    /// Kick off the GPU extent readback. Captures Rc and closure for the async callback.
-    pub fn request_axis_extents(inner_rc: Rc<RefCell<ChartInner>>) {
-        {
-            let mut inner = inner_rc.borrow_mut();
-            if inner.extent_in_flight { inner.extent_dirty = true; return; }
-            inner.request_axis_extents_inner();
-        }
-
-        // Two Rc clones of the readback buffer:
-        // one to call slice().map_async() on, one captured by the closure.
-        let readback_outer = Rc::clone(&inner_rc.borrow().extent_readback_buf);
-        let readback_inner = Rc::clone(&readback_outer);
-        let axis_count = inner_rc.borrow().axis_count;
-        let inner_for_cb = Rc::clone(&inner_rc);
-
-        readback_outer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-            if result.is_err() {
-                inner_for_cb.borrow_mut().extent_in_flight = false;
-                return;
-            }
-            let results: Vec<f32> = {
-                let view = readback_inner.slice(..).get_mapped_range();
-                bytemuck::cast_slice::<u8, f32>(&view).to_vec()
-            };
-            readback_inner.unmap();
-
-            let mut any_changed = false;
-            {
-                let mut inner = inner_for_cb.borrow_mut();
-                inner.extent_in_flight = false;
-                for a in 0..axis_count {
-                    if inner.apply_axis_autoscale(a, results[a * 2], results[a * 2 + 1]) {
-                        any_changed = true;
-                    }
-                }
-            }
-            let rerun = inner_for_cb.borrow().extent_dirty;
-            if any_changed {
-                {
-                    let mut inner = inner_for_cb.borrow_mut();
-                    inner.upload_axes();
-                    inner.update_labels();
-                }
-                ChartInner::request_render(&inner_for_cb);
-            }
-            if rerun {
-                ChartInner::request_axis_extents(Rc::clone(&inner_for_cb));
-            }
-        });
-    }
 }
