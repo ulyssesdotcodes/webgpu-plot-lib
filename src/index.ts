@@ -273,7 +273,7 @@ async function runRust(
   });
 
   window.addEventListener('mouseup', (e) => {
-    if (dragging) { dragging = false; canvas.style.cursor = ''; }
+    if (dragging) { dragging = false; canvas.style.cursor = ''; chart.update_extents(); }
     if (rightDragging) {
       rightDragging = false;
       if (selectionEl) { selectionEl.remove(); selectionEl = null; }
@@ -334,6 +334,7 @@ interface RustChart {
   reset_view(): void;
   resize(css_w: number, css_h: number, dpr: number): void;
   pan(dx_css: number): void;
+  update_extents(): void;
   zoom_at(css_x: number, factor: number): void;
   zoom_to_css_range(css_x0: number, css_x1: number): void;
   pick_x(css_x: number): number;
