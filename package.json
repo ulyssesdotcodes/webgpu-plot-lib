@@ -9,7 +9,7 @@
     "build": "npm run build:ts && npm run build:wasm",
     "watch:ts":"npx tsc -w",
     "watch:wasm": "watchexec -w rust/src -e rs -- wasm-pack build rust/ --target web --out-dir ../public/pkg",
-    "watch": "npx concurrently 'npm run watch:ts' 'npm run watch:wasm'",
+    "watch": "npx concurrently 'npm run watch:ts' 'npm run watch:wasm' 'http-server -c-1 public'",
     "test:rust": "cargo test --manifest-path rust/Cargo.toml",
     "test": "npm run test:rust"
   },

@@ -1,4 +1,6 @@
 node_modules/
-public/*.js*
-public/*.d.ts*
+public/**/*.js*
+public/**/*.d.ts*
+public/**/*.wasm
+public/pkg
 rust/target/
