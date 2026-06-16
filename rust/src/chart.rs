@@ -231,16 +231,16 @@ impl ChartInner {
         // Compute pipelines.
         let spline_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("spline"), layout: None, module: &spline_mod,
-            entry_point: "main", compilation_options: Default::default(),
+            entry_point: Some("main"), compilation_options: Default::default(),
             cache: None,
         });
 
         // Render pipelines.
         let grid_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("grid"), layout: None,
-            vertex:   wgpu::VertexState { module: &grid_mod, entry_point: "vs", buffers: &[], compilation_options: Default::default() },
+            vertex:   wgpu::VertexState { module: &grid_mod, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
             fragment: Some(wgpu::FragmentState {
-                module: &grid_mod, entry_point: "fs",
+                module: &grid_mod, entry_point: Some("fs"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState { format: surface_fmt, blend: None, write_mask: wgpu::ColorWrites::ALL })],
             }),
@@ -255,9 +255,9 @@ impl ChartInner {
 
         let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("lines"), layout: None,
-            vertex:   wgpu::VertexState { module: &lines_mod, entry_point: "vs", buffers: &[], compilation_options: Default::default() },
+            vertex:   wgpu::VertexState { module: &lines_mod, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
             fragment: Some(wgpu::FragmentState {
-                module: &lines_mod, entry_point: "fs",
+                module: &lines_mod, entry_point: Some("fs"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState { format: surface_fmt, blend: Some(alpha_blend), write_mask: wgpu::ColorWrites::ALL })],
             }),
@@ -267,9 +267,9 @@ impl ChartInner {
 
         let point_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("points"), layout: None,
-            vertex:   wgpu::VertexState { module: &points_mod, entry_point: "vs", buffers: &[], compilation_options: Default::default() },
+            vertex:   wgpu::VertexState { module: &points_mod, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
             fragment: Some(wgpu::FragmentState {
-                module: &points_mod, entry_point: "fs",
+                module: &points_mod, entry_point: Some("fs"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState { format: surface_fmt, blend: Some(alpha_blend), write_mask: wgpu::ColorWrites::ALL })],
             }),
@@ -279,9 +279,9 @@ impl ChartInner {
 
         let text_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("text"), layout: None,
-            vertex:   wgpu::VertexState { module: &text_mod, entry_point: "vs", buffers: &[], compilation_options: Default::default() },
+            vertex:   wgpu::VertexState { module: &text_mod, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
             fragment: Some(wgpu::FragmentState {
-                module: &text_mod, entry_point: "fs",
+                module: &text_mod, entry_point: Some("fs"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState { format: surface_fmt, blend: Some(alpha_blend), write_mask: wgpu::ColorWrites::ALL })],
             }),
