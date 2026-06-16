@@ -113,7 +113,9 @@ impl Chart {
     }
 
     pub fn pan(&self, dx_css: f32) {
-        self.inner.borrow_mut().pan(dx_css);
+        let mut inner = self.inner.borrow_mut();
+        inner.pan(dx_css);
+        inner.update_axis_extents_cpu();
         ChartInner::request_render(&self.inner);
     }
 
