@@ -1,19 +1,37 @@
 {
   "name": "webgpu-data-vis",
   "version": "1.0.0",
-  "description": "",
-  "main": "src/index.ts",
+  "description": "WebGPU-accelerated line chart library",
+  "type": "module",
+  "main": "./dist/lib.js",
+  "module": "./dist/lib.js",
+  "types": "./dist/lib.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/lib.js",
+      "types": "./dist/lib.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build:ts": "tsc",
+    "build:npm": "tsc -p tsconfig.npm.json",
     "build:wasm": "wasm-pack build rust/ --target web --out-dir ../public/pkg",
     "build": "npm run build:ts && npm run build:wasm",
-    "watch:ts":"npx tsc -w",
+    "watch:ts": "npx tsc -w",
     "watch:wasm": "watchexec -w rust/src -e rs -- wasm-pack build rust/ --target web --out-dir ../public/pkg",
     "watch": "npx concurrently 'npm run watch:ts' 'npm run watch:wasm' 'http-server -c-1 public'",
     "test:rust": "cargo test --manifest-path rust/Cargo.toml",
     "test": "npm run test:rust"
   },
-  "keywords": [],
+  "keywords": [
+    "webgpu",
+    "chart",
+    "visualization",
+    "canvas"
+  ],
   "author": "",
   "license": "ISC",
   "devDependencies": {
